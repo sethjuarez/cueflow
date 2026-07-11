@@ -1,0 +1,9 @@
+[package]
+name = "cueflow-tauri"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+cueflow-core.workspace = true
