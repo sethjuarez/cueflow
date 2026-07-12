@@ -18,6 +18,8 @@ Cueflow is layered so portable workflow definitions remain independent from plat
    - Uses `RunEventSink` to stream the same event sequence retained in the final run report.
    - Uses an injectable `ExecutionClock` for testable retry backoff and post-call timeout accounting.
    - Resolves explicit platform overrides before invoking an adapter.
+   - Runs adapter-provided preflight diagnostics before any execution side effect; error-severity diagnostics block the run.
+   - Polls adapter-backed wait conditions and maps failed assertions to structured run errors.
    - Stops on failure by default, emits `manualIntervention` for `prompt`, and only continues when explicitly configured.
    - Skips platform calls when `RunConfig.dryRun` is true.
    - Adds `tracing` fields apps can map into observability tools.

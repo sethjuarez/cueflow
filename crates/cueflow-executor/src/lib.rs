@@ -5,8 +5,9 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cueflow_core::{
-    Action, Artifact, AutomationDefinition, BackoffPolicy, OnErrorPolicy, Platform, RunConfig,
-    RunError, RunErrorKind, RunEvent, RunStatus, Step,
+    Action, Artifact, Assertion, AutomationDefinition, BackoffPolicy, OnErrorPolicy, Platform,
+    PreflightDiagnostic, PreflightSeverity, RunConfig, RunError, RunErrorKind, RunEvent, RunStatus,
+    Step, WaitCondition,
 };
 use thiserror::Error;
 use tracing::{error, info, instrument, warn};
@@ -29,6 +30,8 @@ pub struct RunReport {
 pub enum ExecutorError {
     #[error("automation validation failed: {0}")]
     Validation(String),
+    #[error("automation preflight failed: {0}")]
+    Preflight(String),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -56,6 +59,22 @@ impl AdapterError {
         }
     }
 
+    fn timeout() -> Self {
+        Self {
+            public_message: "step timed out".to_string(),
+            kind: RunErrorKind::Timeout,
+            diagnostics: None,
+        }
+    }
+
+    fn assertion(message: impl Into<String>) -> Self {
+        Self {
+            public_message: message.into(),
+            kind: RunErrorKind::Assertion,
+            diagnostics: None,
+        }
+    }
+
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.diagnostics = Some(source.into());
         self
@@ -72,6 +91,58 @@ pub trait ExecutionAdapter {
         action: &Action,
         config: &RunConfig,
     ) -> Result<Vec<Artifact>, AdapterError>;
+
+    fn evaluate_wait(
+        &mut self,
+        condition: &WaitCondition,
+        config: &RunConfig,
+    ) -> Result<ConditionState, AdapterError> {
+        self.execute(
+            &Action::WaitFor {
+                condition: condition.clone(),
+            },
+            config,
+        )
+        .map(|_| ConditionState::Satisfied)
+    }
+
+    fn evaluate_assertion(
+        &mut self,
+        assertion: &Assertion,
+        config: &RunConfig,
+    ) -> Result<bool, AdapterError> {
+        self.execute(
+            &Action::Assert {
+                assertion: assertion.clone(),
+            },
+            config,
+        )
+        .map(|_| true)
+    }
+
+    fn preflight(&self, _action: &Action, _config: &RunConfig) -> Vec<PreflightDiagnostic> {
+        Vec::new()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionState {
+    Pending,
+    Satisfied,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PreflightReport {
+    pub diagnostics: Vec<PreflightDiagnostic>,
+}
+
+impl PreflightReport {
+    pub fn can_run(&self) -> bool {
+        !self
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == PreflightSeverity::Error)
+    }
 }
 
 pub trait RunEventSink {
@@ -189,6 +260,44 @@ impl AutomationExecutor {
         self.run_with(definition, config, adapter, &control, &mut sink, &clock)
     }
 
+    pub fn preflight<A: ExecutionAdapter>(
+        &self,
+        definition: &AutomationDefinition,
+        config: &RunConfig,
+        adapter: &A,
+    ) -> Result<PreflightReport, ExecutorError> {
+        definition
+            .validate()
+            .map_err(|error| ExecutorError::Validation(error.to_string()))?;
+
+        let mut diagnostics = Vec::new();
+        if definition.portability() != cueflow_core::Portability::Portable {
+            diagnostics.push(PreflightDiagnostic {
+                severity: PreflightSeverity::Warning,
+                code: "portability-constrained".to_string(),
+                message: format!(
+                    "automation portability is {:?}; configure a matching platform before running",
+                    definition.portability()
+                ),
+                step_id: None,
+            });
+        }
+
+        for step in &definition.steps {
+            let action = select_action(step, config.platform);
+            diagnostics.extend(adapter.preflight(action, config).into_iter().map(
+                |mut diagnostic| {
+                    if diagnostic.step_id.is_none() {
+                        diagnostic.step_id = Some(step.id.clone());
+                    }
+                    diagnostic
+                },
+            ));
+        }
+
+        Ok(PreflightReport { diagnostics })
+    }
+
     pub fn run_with<A: ExecutionAdapter, S: RunEventSink, C: ExecutionClock>(
         &self,
         definition: &AutomationDefinition,
@@ -201,6 +310,17 @@ impl AutomationExecutor {
         definition
             .validate()
             .map_err(|error| ExecutorError::Validation(error.to_string()))?;
+        let preflight = self.preflight(definition, &config, adapter)?;
+        if !preflight.can_run() {
+            let messages = preflight
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.severity == PreflightSeverity::Error)
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ExecutorError::Preflight(messages));
+        }
 
         let run_id = config.run_id.clone().unwrap_or_else(generate_run_id);
         let mut events = Vec::new();
@@ -338,18 +458,23 @@ impl AutomationExecutor {
             let result = if config.dry_run {
                 Ok(Vec::new())
             } else {
-                adapter.execute(action, config)
+                execute_action(adapter, action, config, step.timeout, control, clock)
             };
             let elapsed = clock.now().saturating_sub(started_at);
-            let result = match (result, step.timeout) {
-                (_, Some(timeout)) if elapsed >= Duration::from_millis(timeout.millis) => {
-                    Err(AdapterError {
-                        public_message: "step timed out".to_string(),
-                        kind: RunErrorKind::Timeout,
-                        diagnostics: None,
-                    })
+            let duration_wait = matches!(
+                action,
+                Action::WaitFor {
+                    condition: WaitCondition::Duration { .. }
                 }
-                (result, _) => result,
+            );
+            let result = if !duration_wait
+                && step
+                    .timeout
+                    .is_some_and(|timeout| elapsed >= Duration::from_millis(timeout.millis))
+            {
+                Err(AdapterError::timeout())
+            } else {
+                result
             };
 
             if control.is_cancelled() {
@@ -413,6 +538,92 @@ impl AutomationExecutor {
             },
         );
         StepOutcome::Failed(error)
+    }
+}
+
+fn execute_action<A: ExecutionAdapter, C: ExecutionClock>(
+    adapter: &mut A,
+    action: &Action,
+    config: &RunConfig,
+    timeout: Option<cueflow_core::DurationSpec>,
+    control: &RunControl,
+    clock: &C,
+) -> Result<Vec<Artifact>, AdapterError> {
+    match action {
+        Action::WaitFor { condition } => {
+            wait_for_condition(adapter, condition, config, timeout, control, clock)?;
+            Ok(Vec::new())
+        }
+        Action::Assert { assertion } => {
+            let passed = adapter.evaluate_assertion(assertion, config)?;
+            if passed {
+                Ok(Vec::new())
+            } else {
+                Err(AdapterError::assertion("assertion failed"))
+            }
+        }
+        _ => adapter.execute(action, config),
+    }
+}
+
+fn wait_for_condition<A: ExecutionAdapter, C: ExecutionClock>(
+    adapter: &mut A,
+    condition: &WaitCondition,
+    config: &RunConfig,
+    timeout: Option<cueflow_core::DurationSpec>,
+    control: &RunControl,
+    clock: &C,
+) -> Result<(), AdapterError> {
+    match condition {
+        WaitCondition::Duration { duration } => {
+            let requested = Duration::from_millis(duration.millis);
+            let timeout = timeout.map(|timeout| Duration::from_millis(timeout.millis));
+            let sleep_for = timeout.map_or(requested, |timeout| requested.min(timeout));
+            if !sleep_with_control(clock, control, sleep_for) {
+                return Err(AdapterError {
+                    public_message: "run cancelled".to_string(),
+                    kind: RunErrorKind::Cancelled,
+                    diagnostics: None,
+                });
+            }
+            if timeout.is_some_and(|timeout| requested > timeout) {
+                return Err(AdapterError::timeout());
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let started_at = clock.now();
+    let timeout = timeout
+        .map(|timeout| Duration::from_millis(timeout.millis))
+        .unwrap_or(Duration::from_secs(30));
+    loop {
+        if control.is_cancelled() {
+            return Err(AdapterError {
+                public_message: "run cancelled".to_string(),
+                kind: RunErrorKind::Cancelled,
+                diagnostics: None,
+            });
+        }
+
+        match adapter.evaluate_wait(condition, config)? {
+            ConditionState::Satisfied => return Ok(()),
+            ConditionState::Pending => {}
+        }
+
+        let elapsed = clock.now().saturating_sub(started_at);
+        if elapsed >= timeout {
+            return Err(AdapterError::timeout());
+        }
+        let remaining = timeout.saturating_sub(elapsed);
+        if !sleep_with_control(clock, control, remaining.min(Duration::from_millis(100))) {
+            return Err(AdapterError {
+                public_message: "run cancelled".to_string(),
+                kind: RunErrorKind::Cancelled,
+                diagnostics: None,
+            });
+        }
     }
 }
 
@@ -543,6 +754,7 @@ fn generate_run_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use cueflow_core::{
@@ -653,6 +865,47 @@ mod tests {
         ) -> Result<Vec<Artifact>, AdapterError> {
             self.clock.advance(self.elapsed);
             Ok(Vec::new())
+        }
+    }
+
+    struct QueryAdapter {
+        wait_states: VecDeque<ConditionState>,
+        assertion_result: bool,
+        execute_calls: usize,
+        preflight_diagnostics: Vec<PreflightDiagnostic>,
+    }
+
+    impl ExecutionAdapter for QueryAdapter {
+        fn execute(
+            &mut self,
+            _action: &Action,
+            _config: &RunConfig,
+        ) -> Result<Vec<Artifact>, AdapterError> {
+            self.execute_calls += 1;
+            Ok(Vec::new())
+        }
+
+        fn evaluate_wait(
+            &mut self,
+            _condition: &WaitCondition,
+            _config: &RunConfig,
+        ) -> Result<ConditionState, AdapterError> {
+            Ok(self
+                .wait_states
+                .pop_front()
+                .unwrap_or(ConditionState::Pending))
+        }
+
+        fn evaluate_assertion(
+            &mut self,
+            _assertion: &Assertion,
+            _config: &RunConfig,
+        ) -> Result<bool, AdapterError> {
+            Ok(self.assertion_result)
+        }
+
+        fn preflight(&self, _action: &Action, _config: &RunConfig) -> Vec<PreflightDiagnostic> {
+            self.preflight_diagnostics.clone()
         }
     }
 
@@ -958,5 +1211,187 @@ mod tests {
         assert_eq!(report.outcome, RunOutcome::Cancelled);
         assert_eq!(adapter.calls, 1);
         assert_eq!(clock.now(), Duration::from_millis(10));
+    }
+
+    #[test]
+    fn wait_conditions_poll_adapter_queries_until_satisfied() {
+        let executor = AutomationExecutor::new();
+        let mut definition = definition();
+        definition.steps[0].action = Action::WaitFor {
+            condition: WaitCondition::ProcessRunning {
+                target: Target::app("Browser"),
+            },
+        };
+        definition.steps[0].timeout = Some(DurationSpec::from_millis(500));
+        let mut adapter = QueryAdapter {
+            wait_states: VecDeque::from([ConditionState::Pending, ConditionState::Satisfied]),
+            assertion_result: true,
+            execute_calls: 0,
+            preflight_diagnostics: Vec::new(),
+        };
+        let clock = FakeClock::default();
+        let control = RunControl::default();
+        let mut sink = NoopEventSink;
+
+        let report = executor
+            .run_with(
+                &definition,
+                RunConfig {
+                    dry_run: false,
+                    ..RunConfig::default()
+                },
+                &mut adapter,
+                &control,
+                &mut sink,
+                &clock,
+            )
+            .expect("wait succeeds");
+
+        assert_eq!(report.outcome, RunOutcome::Succeeded);
+        assert_eq!(clock.now(), Duration::from_millis(100));
+        assert_eq!(adapter.execute_calls, 0);
+    }
+
+    #[test]
+    fn assertions_produce_structured_assertion_failures() {
+        let executor = AutomationExecutor::new();
+        let mut definition = definition();
+        definition.steps[0].action = Action::Assert {
+            assertion: Assertion::TargetExists {
+                target: Target::app("Browser"),
+            },
+        };
+        let mut adapter = QueryAdapter {
+            wait_states: VecDeque::new(),
+            assertion_result: false,
+            execute_calls: 0,
+            preflight_diagnostics: Vec::new(),
+        };
+        let control = RunControl::default();
+        let mut sink = NoopEventSink;
+
+        let report = executor
+            .run_with(
+                &definition,
+                RunConfig {
+                    dry_run: false,
+                    ..RunConfig::default()
+                },
+                &mut adapter,
+                &control,
+                &mut sink,
+                &FakeClock::default(),
+            )
+            .expect("assertion failure returns report");
+
+        assert!(matches!(
+            report.events[2],
+            RunEvent::StepFailed {
+                error: RunError {
+                    kind: RunErrorKind::Assertion,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn preflight_blocks_side_effects_when_an_adapter_reports_errors() {
+        let executor = AutomationExecutor::new();
+        let mut adapter = QueryAdapter {
+            wait_states: VecDeque::new(),
+            assertion_result: true,
+            execute_calls: 0,
+            preflight_diagnostics: vec![PreflightDiagnostic {
+                severity: PreflightSeverity::Error,
+                code: "missing-permission".to_string(),
+                message: "Accessibility permission is required".to_string(),
+                step_id: None,
+            }],
+        };
+        let control = RunControl::default();
+        let mut sink = NoopEventSink;
+
+        assert!(matches!(
+            executor.run_with(
+                &definition(),
+                RunConfig {
+                    dry_run: false,
+                    ..RunConfig::default()
+                },
+                &mut adapter,
+                &control,
+                &mut sink,
+                &FakeClock::default(),
+            ),
+            Err(ExecutorError::Preflight(_))
+        ));
+        assert_eq!(adapter.execute_calls, 0);
+    }
+
+    #[test]
+    fn duration_wait_honors_its_step_timeout_without_sleeping_past_it() {
+        let executor = AutomationExecutor::new();
+        let mut definition = definition();
+        definition.steps[0].action = Action::WaitFor {
+            condition: WaitCondition::Duration {
+                duration: DurationSpec::from_millis(100),
+            },
+        };
+        definition.steps[0].timeout = Some(DurationSpec::from_millis(5));
+        let mut adapter = RecordingAdapter::default();
+        let clock = FakeClock::default();
+        let control = RunControl::default();
+        let mut sink = NoopEventSink;
+
+        let report = executor
+            .run_with(
+                &definition,
+                RunConfig {
+                    dry_run: false,
+                    ..RunConfig::default()
+                },
+                &mut adapter,
+                &control,
+                &mut sink,
+                &clock,
+            )
+            .expect("timeout returns a report");
+
+        assert_eq!(report.outcome, RunOutcome::Failed);
+        assert_eq!(clock.now(), Duration::from_millis(5));
+        assert_eq!(adapter.calls, 0);
+    }
+
+    #[test]
+    fn adapters_that_only_implement_execute_keep_wait_support() {
+        let executor = AutomationExecutor::new();
+        let mut definition = definition();
+        definition.steps[0].action = Action::WaitFor {
+            condition: WaitCondition::ProcessRunning {
+                target: Target::app("Browser"),
+            },
+        };
+        let mut adapter = RecordingAdapter::default();
+        let control = RunControl::default();
+        let mut sink = NoopEventSink;
+
+        let report = executor
+            .run_with(
+                &definition,
+                RunConfig {
+                    dry_run: false,
+                    ..RunConfig::default()
+                },
+                &mut adapter,
+                &control,
+                &mut sink,
+                &FakeClock::default(),
+            )
+            .expect("legacy adapter wait succeeds");
+
+        assert_eq!(report.outcome, RunOutcome::Succeeded);
+        assert_eq!(adapter.actions, vec!["waitFor"]);
     }
 }

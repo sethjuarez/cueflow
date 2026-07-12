@@ -1315,6 +1315,23 @@ pub struct RunError {
     pub source: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreflightDiagnostic {
+    pub severity: PreflightSeverity,
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PreflightSeverity {
+    Warning,
+    Error,
+}
+
 impl RunError {
     pub fn new(kind: RunErrorKind, message: impl Into<String>) -> Self {
         Self {
