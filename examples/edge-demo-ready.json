@@ -1,0 +1,78 @@
+{
+  "id": "edge-demo-ready",
+  "title": "Prepare Edge demo state",
+  "description": "Return Microsoft Edge to cueflow.dev without coordinates or app-specific scripting.",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "launch-cueflow",
+      "kind": "launchUrl",
+      "url": "https://cueflow.dev",
+      "timeout": {
+        "millis": 10000
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "delay": {
+          "millis": 500
+        },
+        "backoff": "linear"
+      },
+      "onError": "stop"
+    },
+    {
+      "id": "wait-for-browser",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "duration",
+        "duration": {
+          "millis": 1500
+        }
+      },
+      "timeout": {
+        "millis": 3000
+      },
+      "retry": {
+        "maxAttempts": 1,
+        "backoff": "none"
+      },
+      "onError": "stop"
+    },
+    {
+      "id": "open-address-bar",
+      "kind": "pressKey",
+      "keys": "Ctrl+L",
+      "retry": {
+        "maxAttempts": 1,
+        "backoff": "none"
+      },
+      "onError": "stop"
+    },
+    {
+      "id": "enter-demo-url",
+      "kind": "typeText",
+      "text": "https://cueflow.dev",
+      "retry": {
+        "maxAttempts": 1,
+        "backoff": "none"
+      },
+      "onError": "stop"
+    },
+    {
+      "id": "navigate",
+      "kind": "pressKey",
+      "keys": "Enter",
+      "timeout": {
+        "millis": 10000
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "delay": {
+          "millis": 500
+        },
+        "backoff": "linear"
+      },
+      "onError": "stop"
+    }
+  ]
+}

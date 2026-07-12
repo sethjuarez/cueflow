@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/cueflow-adapters",
+    "crates/cueflow-adapters", "crates/cueflow-cli",
     "crates/cueflow-core",
     "crates/cueflow-executor",
     "crates/cueflow-recorder",

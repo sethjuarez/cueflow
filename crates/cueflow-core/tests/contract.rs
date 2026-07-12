@@ -5,6 +5,7 @@ use serde_json::Value;
 
 const AUTOMATION_V1: &str = include_str!("fixtures/automation-v1.json");
 const AUTOMATION_V0: &str = include_str!("fixtures/automation-v0.json");
+const EDGE_DEMO_READY: &str = include_str!("../../../examples/edge-demo-ready.json");
 
 #[test]
 fn v1_fixture_is_a_stable_json_round_trip() {
@@ -81,4 +82,15 @@ fn blank_selectors_are_rejected_even_when_another_selector_is_present() {
         error,
         DefinitionParseError::Validation(ValidationError::BlankField("target processName"))
     ));
+}
+
+#[test]
+fn edge_demo_fixture_remains_a_valid_portable_definition() {
+    let definition = parse_definition_json(EDGE_DEMO_READY).expect("edge fixture parses");
+
+    assert_eq!(definition.id, "edge-demo-ready");
+    assert_eq!(
+        definition.portability(),
+        cueflow_core::Portability::Portable
+    );
 }

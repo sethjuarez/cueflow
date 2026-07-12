@@ -81,3 +81,5 @@ Windows is the first execution target. The Windows adapter uses native shell, wi
 ```powershell
 cargo test --workspace
 ```
+
+`examples/edge-demo-ready.json` is the first idempotent Windows reliability fixture. It returns Edge to cueflow.dev using only portable actions; run it through a Cueflow host after confirming it is safe to foreground and type into Edge.

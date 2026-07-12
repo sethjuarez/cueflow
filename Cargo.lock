@@ -12,6 +12,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cueflow-cli"
+version = "0.1.0"
+dependencies = [
+ "cueflow-adapters",
+ "cueflow-core",
+ "cueflow-executor",
+ "serde_json",
+]
+
+[[package]]
 name = "cueflow-core"
 version = "0.1.0"
 dependencies = [

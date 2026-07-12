@@ -1,0 +1,12 @@
+[package]
+name = "cueflow-cli"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+
+[dependencies]
+cueflow-adapters = { path = "../cueflow-adapters" }
+cueflow-core.workspace = true
+cueflow-executor.workspace = true
+serde_json.workspace = true
