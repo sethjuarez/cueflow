@@ -350,7 +350,9 @@ fn unsupported_window_target_reason(target: &Target) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use cueflow_core::AccessibilityTarget;
+    use std::collections::BTreeMap;
+
+    use cueflow_core::{AccessibilityTarget, PlatformSelector};
 
     use super::*;
 
@@ -394,5 +396,35 @@ mod tests {
             &RunConfig::default(),
         );
         assert_eq!(selector_diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn preflight_accepts_a_resolved_windows_window_title_selector() {
+        let adapter = WindowsDesktopAdapter;
+        let action = Action::FocusWindow {
+            target: Target {
+                app_name: Some("Browser".to_string()),
+                process_name: None,
+                window_title: None,
+                title_contains: Some("Google".to_string()),
+                url: None,
+                file_path: None,
+                accessibility: None,
+                image: None,
+                coordinates: None,
+                platform_selectors: BTreeMap::from([(
+                    Platform::Windows,
+                    PlatformSelector {
+                        process_name: None,
+                        window_title: Some("Google".to_string()),
+                        accessibility_query: None,
+                        command_hint: None,
+                    },
+                )]),
+            },
+        }
+        .for_platform(Some(Platform::Windows));
+
+        assert!(adapter.preflight(&action, &RunConfig::default()).is_empty());
     }
 }

@@ -790,6 +790,56 @@ impl Action {
         Ok(())
     }
 
+    pub fn for_platform(&self, platform: Option<Platform>) -> Self {
+        match self {
+            Self::LaunchUrl { url, target } => Self::LaunchUrl {
+                url: url.clone(),
+                target: target.as_ref().map(|target| target.for_platform(platform)),
+            },
+            Self::LaunchApp { app, target } => Self::LaunchApp {
+                app: app.clone(),
+                target: target.as_ref().map(|target| target.for_platform(platform)),
+            },
+            Self::FocusWindow { target } => Self::FocusWindow {
+                target: target.for_platform(platform),
+            },
+            Self::TypeText { text, target } => Self::TypeText {
+                text: text.clone(),
+                target: target.as_ref().map(|target| target.for_platform(platform)),
+            },
+            Self::PressKey { keys, target } => Self::PressKey {
+                keys: keys.clone(),
+                target: target.as_ref().map(|target| target.for_platform(platform)),
+            },
+            Self::ClickTarget { target } => Self::ClickTarget {
+                target: target.for_platform(platform),
+            },
+            Self::Scroll {
+                delta_x,
+                delta_y,
+                target,
+            } => Self::Scroll {
+                delta_x: *delta_x,
+                delta_y: *delta_y,
+                target: target.as_ref().map(|target| target.for_platform(platform)),
+            },
+            Self::WaitFor { condition } => Self::WaitFor {
+                condition: condition.for_platform(platform),
+            },
+            Self::Assert { assertion } => Self::Assert {
+                assertion: assertion.for_platform(platform),
+            },
+            Self::RunCommand { command, args } => Self::RunCommand {
+                command: command.clone(),
+                args: args.clone(),
+            },
+            Self::OpenFile { path, target } => Self::OpenFile {
+                path: path.clone(),
+                target: target.as_ref().map(|target| target.for_platform(platform)),
+            },
+        }
+    }
+
     fn collect_platforms(&self, platforms: &mut BTreeSet<Platform>) {
         match self {
             Action::LaunchUrl { target, .. }
@@ -907,6 +957,42 @@ impl Target {
         }
 
         Ok(())
+    }
+
+    pub fn for_platform(&self, platform: Option<Platform>) -> Self {
+        let Some(platform) = platform else {
+            return self.clone();
+        };
+
+        let Some(selector) = self.platform_selectors.get(&platform) else {
+            let mut target = self.clone();
+            target.platform_selectors.clear();
+            return target;
+        };
+
+        let mut target = Self {
+            app_name: None,
+            process_name: selector.process_name.clone(),
+            window_title: selector.window_title.clone(),
+            title_contains: None,
+            url: None,
+            file_path: None,
+            accessibility: selector
+                .accessibility_query
+                .as_ref()
+                .map(|name| AccessibilityTarget {
+                    id: None,
+                    name: Some(name.clone()),
+                    control_type: None,
+                }),
+            image: None,
+            coordinates: None,
+            platform_selectors: BTreeMap::new(),
+        };
+        if selector.command_hint.is_some() {
+            target.platform_selectors.insert(platform, selector.clone());
+        }
+        target
     }
 
     fn collect_platforms(&self, platforms: &mut BTreeSet<Platform>) {
@@ -1157,6 +1243,28 @@ impl WaitCondition {
         }
     }
 
+    pub fn for_platform(&self, platform: Option<Platform>) -> Self {
+        match self {
+            Self::Duration { duration } => Self::Duration {
+                duration: *duration,
+            },
+            Self::WindowExists { target } => Self::WindowExists {
+                target: target.for_platform(platform),
+            },
+            Self::WindowFocused { target } => Self::WindowFocused {
+                target: target.for_platform(platform),
+            },
+            Self::ProcessRunning { target } => Self::ProcessRunning {
+                target: target.for_platform(platform),
+            },
+            Self::FileExists { path } => Self::FileExists { path: path.clone() },
+            Self::CommandExits { command, args } => Self::CommandExits {
+                command: command.clone(),
+                args: args.clone(),
+            },
+        }
+    }
+
     fn collect_platforms(&self, platforms: &mut BTreeSet<Platform>) {
         match self {
             WaitCondition::WindowExists { target }
@@ -1181,6 +1289,17 @@ impl Assertion {
         match self {
             Assertion::Condition { condition } => condition.validate(),
             Assertion::TargetExists { target } => target.validate(),
+        }
+    }
+
+    pub fn for_platform(&self, platform: Option<Platform>) -> Self {
+        match self {
+            Self::Condition { condition } => Self::Condition {
+                condition: condition.for_platform(platform),
+            },
+            Self::TargetExists { target } => Self::TargetExists {
+                target: target.for_platform(platform),
+            },
         }
     }
 

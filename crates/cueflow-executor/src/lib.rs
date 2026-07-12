@@ -284,15 +284,20 @@ impl AutomationExecutor {
         }
 
         for step in &definition.steps {
-            let action = select_action(step, config.platform);
-            diagnostics.extend(adapter.preflight(action, config).into_iter().map(
-                |mut diagnostic| {
-                    if diagnostic.step_id.is_none() {
-                        diagnostic.step_id = Some(step.id.clone());
-                    }
-                    diagnostic
-                },
-            ));
+            let action = select_action(step, config.platform).for_platform(config.platform);
+            diagnostics.extend(
+                std::iter::once(action)
+                    .chain(step.conditions.iter().map(|condition| Action::WaitFor {
+                        condition: condition.for_platform(config.platform),
+                    }))
+                    .flat_map(|action| adapter.preflight(&action, config))
+                    .map(|mut diagnostic| {
+                        if diagnostic.step_id.is_none() {
+                            diagnostic.step_id = Some(step.id.clone());
+                        }
+                        diagnostic
+                    }),
+            );
         }
 
         Ok(PreflightReport { diagnostics })
@@ -435,7 +440,7 @@ impl AutomationExecutor {
         sink: &mut S,
         clock: &C,
     ) -> StepOutcome {
-        let action = select_action(step, config.platform);
+        let action = select_action(step, config.platform).for_platform(config.platform);
         emit(
             events,
             sink,
@@ -458,11 +463,19 @@ impl AutomationExecutor {
             let result = if config.dry_run {
                 Ok(Vec::new())
             } else {
-                execute_action(adapter, action, config, step.timeout, control, clock)
+                execute_step(
+                    adapter,
+                    &step.conditions,
+                    &action,
+                    config,
+                    step.timeout,
+                    control,
+                    clock,
+                )
             };
             let elapsed = clock.now().saturating_sub(started_at);
             let duration_wait = matches!(
-                action,
+                &action,
                 Action::WaitFor {
                     condition: WaitCondition::Duration { .. }
                 }
@@ -564,6 +577,22 @@ fn execute_action<A: ExecutionAdapter, C: ExecutionClock>(
         }
         _ => adapter.execute(action, config),
     }
+}
+
+fn execute_step<A: ExecutionAdapter, C: ExecutionClock>(
+    adapter: &mut A,
+    conditions: &[WaitCondition],
+    action: &Action,
+    config: &RunConfig,
+    timeout: Option<cueflow_core::DurationSpec>,
+    control: &RunControl,
+    clock: &C,
+) -> Result<Vec<Artifact>, AdapterError> {
+    for condition in conditions {
+        let condition = condition.for_platform(config.platform);
+        wait_for_condition(adapter, &condition, config, timeout, control, clock)?;
+    }
+    execute_action(adapter, action, config, timeout, control, clock)
 }
 
 fn wait_for_condition<A: ExecutionAdapter, C: ExecutionClock>(
@@ -1059,6 +1088,88 @@ mod tests {
         assert!(matches!(
             report.events[1],
             RunEvent::StepStarted { ref step_kind, .. } if step_kind == "launchApp"
+        ));
+    }
+
+    #[test]
+    fn step_conditions_are_satisfied_before_the_action_executes() {
+        let executor = AutomationExecutor::new();
+        let mut definition = definition();
+        definition.steps[0].conditions = vec![WaitCondition::WindowExists {
+            target: Target::app("Browser"),
+        }];
+        definition.steps[0].timeout = Some(DurationSpec::from_millis(500));
+        let mut adapter = QueryAdapter {
+            wait_states: VecDeque::from([ConditionState::Pending, ConditionState::Satisfied]),
+            assertion_result: true,
+            execute_calls: 0,
+            preflight_diagnostics: Vec::new(),
+        };
+        let clock = FakeClock::default();
+        let control = RunControl::default();
+        let mut sink = NoopEventSink;
+
+        let report = executor
+            .run_with(
+                &definition,
+                RunConfig {
+                    dry_run: false,
+                    ..RunConfig::default()
+                },
+                &mut adapter,
+                &control,
+                &mut sink,
+                &clock,
+            )
+            .expect("run succeeds");
+
+        assert_eq!(report.outcome, RunOutcome::Succeeded);
+        assert_eq!(adapter.execute_calls, 1);
+        assert_eq!(clock.now(), Duration::from_millis(100));
+    }
+
+    #[test]
+    fn failed_step_conditions_prevent_action_execution() {
+        let executor = AutomationExecutor::new();
+        let mut definition = definition();
+        definition.steps[0].conditions = vec![WaitCondition::WindowExists {
+            target: Target::app("Browser"),
+        }];
+        definition.steps[0].timeout = Some(DurationSpec::from_millis(100));
+        let mut adapter = QueryAdapter {
+            wait_states: VecDeque::new(),
+            assertion_result: true,
+            execute_calls: 0,
+            preflight_diagnostics: Vec::new(),
+        };
+        let control = RunControl::default();
+        let mut sink = NoopEventSink;
+
+        let report = executor
+            .run_with(
+                &definition,
+                RunConfig {
+                    dry_run: false,
+                    ..RunConfig::default()
+                },
+                &mut adapter,
+                &control,
+                &mut sink,
+                &FakeClock::default(),
+            )
+            .expect("condition timeout returns a failed report");
+
+        assert_eq!(report.outcome, RunOutcome::Failed);
+        assert_eq!(adapter.execute_calls, 0);
+        assert!(matches!(
+            report.events[2],
+            RunEvent::StepFailed {
+                error: RunError {
+                    kind: RunErrorKind::Timeout,
+                    ..
+                },
+                ..
+            }
         ));
     }
 

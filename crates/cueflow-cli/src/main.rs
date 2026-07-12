@@ -1,6 +1,6 @@
 use std::{env, fs, process::ExitCode};
 
-use cueflow_adapters::CurrentPlatformAdapter;
+use cueflow_adapters::{CurrentPlatformAdapter, current_platform};
 use cueflow_core::{RunConfig, parse_definition_json};
 use cueflow_executor::{AutomationExecutor, RunControl, RunEventSink, RunOutcome, SystemClock};
 
@@ -57,6 +57,7 @@ fn main() -> ExitCode {
     let clock = SystemClock::default();
     let config = RunConfig {
         dry_run: command == "dry-run",
+        platform: Some(current_platform()),
         ..RunConfig::default()
     };
     match executor.run_with(

@@ -1,13 +1,13 @@
 {
   "id": "edge-demo-ready",
   "title": "Prepare Edge demo state",
-  "description": "Return Microsoft Edge to cueflow.dev without coordinates or app-specific scripting.",
+  "description": "Return Microsoft Edge to google.com without coordinates or app-specific scripting.",
   "schemaVersion": 1,
   "steps": [
     {
       "id": "launch-cueflow",
       "kind": "launchUrl",
-      "url": "https://cueflow.dev",
+      "url": "https://google.com",
       "timeout": {
         "millis": 10000
       },
@@ -51,7 +51,7 @@
     {
       "id": "enter-demo-url",
       "kind": "typeText",
-      "text": "https://cueflow.dev",
+      "text": "https://google.com",
       "retry": {
         "maxAttempts": 1,
         "backoff": "none"

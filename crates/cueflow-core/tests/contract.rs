@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
+
 use cueflow_core::{
-    DefinitionParseError, ValidationError, automation_definition_schema, parse_definition_json,
+    Action, DefinitionParseError, Platform, PlatformSelector, Target, ValidationError,
+    automation_definition_schema, parse_definition_json,
 };
 use serde_json::Value;
 
@@ -93,4 +96,38 @@ fn edge_demo_fixture_remains_a_valid_portable_definition() {
         definition.portability(),
         cueflow_core::Portability::Portable
     );
+}
+
+#[test]
+fn platform_selector_replaces_generic_target_fields_for_execution() {
+    let action = Action::FocusWindow {
+        target: Target {
+            app_name: Some("Browser".to_string()),
+            process_name: None,
+            window_title: None,
+            title_contains: Some("Google".to_string()),
+            url: None,
+            file_path: None,
+            accessibility: None,
+            image: None,
+            coordinates: None,
+            platform_selectors: BTreeMap::from([(
+                Platform::Windows,
+                PlatformSelector {
+                    process_name: None,
+                    window_title: Some("Google".to_string()),
+                    accessibility_query: None,
+                    command_hint: None,
+                },
+            )]),
+        },
+    };
+
+    let Action::FocusWindow { target } = action.for_platform(Some(Platform::Windows)) else {
+        panic!("action remains a window focus action");
+    };
+    assert_eq!(target.window_title.as_deref(), Some("Google"));
+    assert!(target.app_name.is_none());
+    assert!(target.title_contains.is_none());
+    assert!(target.platform_selectors.is_empty());
 }

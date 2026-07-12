@@ -76,10 +76,16 @@ Runs emit structured `RunEvent` values that apps can map into traces, logs, time
 
 Windows is the first execution target. The Windows adapter uses native shell, window, and input APIs for application/URL/file launch, exact-title window focus, Unicode typing, normalized key chords, and wheel scrolling. Accessibility selectors and semantic click targets remain explicitly preflight-gated until a Windows UI Automation layer is added. macOS concepts remain in the portable schema and adapter capability boundary for a later native implementation.
 
+## Confidence
+
+Windows execution confidence is currently 8/10; overall project confidence is 7/10. The workspace test suite passes, and the Edge-to-Google workflow has completed successfully on Windows after platform selection, condition gating, and platform selector resolution were covered by regression tests.
+
+The remaining risk is execution breadth rather than a known correctness failure: semantic accessibility and click selectors await Windows UI Automation, window matching currently requires an exact title, and live testing has been limited to this Windows environment and browser workflow.
+
 ## Development
 
 ```powershell
 cargo test --workspace
 ```
 
-`examples/edge-demo-ready.json` is the first idempotent Windows reliability fixture. It returns Edge to cueflow.dev using only portable actions; run it through a Cueflow host after confirming it is safe to foreground and type into Edge.
+`examples/edge-demo-ready.json` is the first idempotent Windows reliability fixture. It returns Edge to google.com using only portable actions; run it through a Cueflow host after confirming it is safe to foreground and type into Edge.
