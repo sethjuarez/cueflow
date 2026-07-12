@@ -72,6 +72,10 @@ Definitions declare typed variables with optional literal defaults or a named `s
 
 Runs emit structured `RunEvent` values that apps can map into traces, logs, timelines, or artifacts. The executor also uses `tracing` fields for `automation_id`, `run_id`, `step_id`, `step_kind`, `target`, and `error`. Cueflow stays standalone and does not require Auditaur or any other tracing backend.
 
+## Platform support
+
+Windows is the first execution target. The Windows adapter uses native shell, window, and input APIs for application/URL/file launch, exact-title window focus, Unicode typing, normalized key chords, and wheel scrolling. Accessibility selectors and semantic click targets remain explicitly preflight-gated until a Windows UI Automation layer is added. macOS concepts remain in the portable schema and adapter capability boundary for a later native implementation.
+
 ## Development
 
 ```powershell

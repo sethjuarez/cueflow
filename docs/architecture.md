@@ -26,8 +26,9 @@ Cueflow is layered so portable workflow definitions remain independent from plat
 
 3. `cueflow-adapters`
    - Defines the platform boundary for launch, focus, input, window, and process operations through the executor adapter trait.
-   - Starts with no-op and unsupported current-platform adapters.
-   - Real platform modules should live behind `cfg` boundaries.
+   - Ships a Windows-first module behind `cfg(windows)` for native shell launch, exact-title window focus/query, `SendInput` text/key/scroll injection, and file existence checks.
+   - Rejects unsupported selector shapes and UI Automation-dependent actions during preflight instead of silently ignoring constraints.
+   - Retains no-op/non-Windows adapters while macOS and Linux implementations are added behind the same portable contract.
 
 4. `cueflow-recorder`
    - Represents optional capture/authoring.

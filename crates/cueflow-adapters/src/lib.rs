@@ -24,11 +24,19 @@ impl ExecutionAdapter for NoopDesktopAdapter {
     }
 }
 
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[cfg(target_os = "windows")]
+pub use windows::WindowsDesktopAdapter as CurrentPlatformAdapter;
+
+#[cfg(not(target_os = "windows"))]
 #[derive(Debug, Default)]
 pub struct CurrentPlatformAdapter {
     noop: NoopDesktopAdapter,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl CurrentPlatformAdapter {
     pub fn capabilities() -> AdapterCapabilities {
         AdapterCapabilities {
@@ -42,6 +50,7 @@ impl CurrentPlatformAdapter {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 impl ExecutionAdapter for CurrentPlatformAdapter {
     fn execute(
         &mut self,
@@ -53,7 +62,7 @@ impl ExecutionAdapter for CurrentPlatformAdapter {
         }
 
         Err(AdapterError::unsupported(format!(
-            "real execution is not implemented for {} yet",
+            "real execution is not implemented for {} on this platform",
             action.kind()
         )))
     }
