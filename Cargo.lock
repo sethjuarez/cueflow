@@ -52,7 +52,9 @@ dependencies = [
 name = "cueflow-tauri"
 version = "0.1.0"
 dependencies = [
+ "cueflow-adapters",
  "cueflow-core",
+ "cueflow-executor",
 ]
 
 [[package]]

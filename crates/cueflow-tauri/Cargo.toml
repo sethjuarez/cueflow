@@ -7,3 +7,5 @@ repository.workspace = true
 
 [dependencies]
 cueflow-core.workspace = true
+cueflow-adapters.workspace = true
+cueflow-executor.workspace = true

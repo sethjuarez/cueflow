@@ -51,7 +51,7 @@ fn main() -> ExitCode {
     }
 
     let executor = AutomationExecutor::new();
-    let mut adapter = CurrentPlatformAdapter;
+    let mut adapter = CurrentPlatformAdapter::new();
     let mut sink = JsonlSink;
     let control = RunControl::default();
     let clock = SystemClock::default();

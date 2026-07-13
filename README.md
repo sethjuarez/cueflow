@@ -12,7 +12,7 @@ The core primitive is an intentional automation workflow: a reusable definition 
 | `cueflow-executor` | Run orchestration, dry-run/no-op execution, retry/stop policy handling, run events, and structured tracing fields. |
 | `cueflow-adapters` | Platform adapter boundary plus a no-op/current-platform stub. Real Windows, macOS, and Linux adapters are follow-up work. |
 | `cueflow-recorder` | Optional capture-to-DSL surface. It intentionally emits `AutomationDefinition` rather than a separate macro format. |
-| `cueflow-tauri` | Optional thin bridge shape for apps that submit automation run requests from a frontend. |
+| `cueflow-tauri` | Optional host bridge that executes automation requests with run control and structured event forwarding. |
 
 ## DSL sketch
 
@@ -68,19 +68,31 @@ Targets should use logical descriptors first: app name, process name, window tit
 
 Definitions declare typed variables with optional literal defaults or a named `secretReference`. Run configuration values override defaults. `resolve_run()` resolves `${variable}` references in step fields, working directories, and environment values; recursive references are supported and cycles fail explicitly. Callers supply secret material through the `SecretResolver` trait. Resolved secret variables provide redacted values for logs and diagnostics, and Cueflow does not emit resolved variable values in run events.
 
+## Command policy
+
+`runCommand` and `commandExits` execute a command directly without shell interpolation. They are disabled unless the host supplies the exact executable name in `RunConfig.approved_commands`; the configured working directory and environment are applied. Command processes are terminated when the step reaches its timeout or the host cancels the run. Hosts should approve only idempotent commands for `commandExits`, because the condition can be evaluated repeatedly while waiting.
+
 ## Observability
 
 Runs emit structured `RunEvent` values that apps can map into traces, logs, timelines, or artifacts. The executor also uses `tracing` fields for `automation_id`, `run_id`, `step_id`, `step_kind`, `target`, and `error`. Cueflow stays standalone and does not require Auditaur or any other tracing backend.
 
 ## Platform support
 
-Windows is the first execution target. The Windows adapter uses native shell, window, and input APIs for application/URL/file launch, exact-title window focus, Unicode typing, normalized key chords, and wheel scrolling. Accessibility selectors and semantic click targets remain explicitly preflight-gated until a Windows UI Automation layer is added. macOS concepts remain in the portable schema and adapter capability boundary for a later native implementation.
+Windows is the first execution target. The Windows adapter uses native shell, window, and input APIs for application/URL/file launch, case-insensitive exact or fragment title window focus, Unicode typing, normalized key chords, and wheel scrolling. Window title selectors must resolve to exactly one visible top-level window, and focus is verified immediately after activation.
+
+Windows UI Automation provides the semantic path for `clickTarget`, targeted `typeText` and `scroll`, `windowExists` and `windowFocused`, and `targetExists` assertions. A semantic target must combine a unique window title selector with an `accessibility` selector (`id`, `name`, and/or `controlType`) that resolves to exactly one element; invocation, value assignment, scrolling, and focus inspection do not require foreground activation. Targeted key chords remain preflight-gated until their UI Automation equivalent is implemented. macOS concepts remain in the portable schema and adapter capability boundary for a later native implementation.
+
+Windows also supports `processRunning` for an exact `processName` selector (for example, `msedge.exe`). Other target fields are rejected for process checks until process-path and application-identity matching are implemented.
 
 ## Confidence
 
 Windows execution confidence is currently 8/10; overall project confidence is 7/10. The workspace test suite passes, and the Edge-to-Google workflow has completed successfully on Windows after platform selection, condition gating, and platform selector resolution were covered by regression tests.
 
-The remaining risk is execution breadth rather than a known correctness failure: semantic accessibility and click selectors await Windows UI Automation, window matching currently requires an exact title, and live testing has been limited to this Windows environment and browser workflow.
+The remaining risk is execution breadth rather than a known correctness failure: live mutating UIA actions have not yet been run against a real application, and validation has been limited to this Windows environment and browser workflow.
+
+## Development status
+
+Cueflow is in active development. Windows is the first supported execution target, with fail-closed window selection, scoped UI Automation actions, process readiness checks, and host-approved command execution. macOS and Linux retain the same portable contract but currently reject real execution. Native recording, macOS Accessibility support, and broader live application coverage remain planned work.
 
 ## Development
 

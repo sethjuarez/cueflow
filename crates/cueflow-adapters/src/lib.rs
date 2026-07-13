@@ -7,6 +7,7 @@ pub struct AdapterCapabilities {
     pub supports_launch: bool,
     pub supports_focus: bool,
     pub supports_input: bool,
+    pub supports_semantic_targets: bool,
     pub supports_window_queries: bool,
     pub supports_process_queries: bool,
 }
@@ -30,6 +31,13 @@ mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::WindowsDesktopAdapter as CurrentPlatformAdapter;
 
+#[cfg(target_os = "windows")]
+impl CurrentPlatformAdapter {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
 #[derive(Debug, Default)]
 pub struct CurrentPlatformAdapter {
@@ -38,12 +46,17 @@ pub struct CurrentPlatformAdapter {
 
 #[cfg(not(target_os = "windows"))]
 impl CurrentPlatformAdapter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn capabilities() -> AdapterCapabilities {
         AdapterCapabilities {
             platform: current_platform(),
             supports_launch: false,
             supports_focus: false,
             supports_input: false,
+            supports_semantic_targets: false,
             supports_window_queries: false,
             supports_process_queries: false,
         }

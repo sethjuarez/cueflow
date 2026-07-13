@@ -5,9 +5,9 @@
   "schemaVersion": 1,
   "steps": [
     {
-      "id": "launch-cueflow",
-      "kind": "launchUrl",
-      "url": "https://google.com",
+      "id": "launch-edge",
+      "kind": "launchApp",
+      "app": "msedge.exe",
       "timeout": {
         "millis": 10000
       },
@@ -24,10 +24,25 @@
       "id": "wait-for-browser",
       "kind": "waitFor",
       "condition": {
-        "kind": "duration",
-        "duration": {
-          "millis": 1500
+        "kind": "windowExists",
+        "target": {
+          "titleContains": "Microsoft Edge"
         }
+      },
+      "timeout": {
+        "millis": 3000
+      },
+      "retry": {
+        "maxAttempts": 1,
+        "backoff": "none"
+      },
+      "onError": "stop"
+    },
+    {
+      "id": "focus-browser",
+      "kind": "focusWindow",
+      "target": {
+        "titleContains": "Microsoft Edge"
       },
       "timeout": {
         "millis": 3000

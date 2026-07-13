@@ -46,13 +46,13 @@ impl VariableDefinition {
             ));
         }
 
-        if let Some(VariableSource::Literal { value }) = &self.default {
-            if !self.value_type.accepts(value) {
-                return Err(ValidationError::InvalidVariableType {
-                    name: name.to_string(),
-                    expected: self.value_type,
-                });
-            }
+        if let Some(VariableSource::Literal { value }) = &self.default
+            && !self.value_type.accepts(value)
+        {
+            return Err(ValidationError::InvalidVariableType {
+                name: name.to_string(),
+                expected: self.value_type,
+            });
         }
 
         Ok(())
@@ -1324,6 +1324,8 @@ pub struct RunConfig {
     pub working_directory: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub approved_commands: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<Platform>,
 }
@@ -1336,6 +1338,7 @@ impl Default for RunConfig {
             variables: BTreeMap::new(),
             working_directory: None,
             environment: BTreeMap::new(),
+            approved_commands: BTreeSet::new(),
             platform: None,
         }
     }

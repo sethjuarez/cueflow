@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use cueflow_core::{
     Action, Artifact, Assertion, AutomationDefinition, BackoffPolicy, OnErrorPolicy, Platform,
     PreflightDiagnostic, PreflightSeverity, RunConfig, RunError, RunErrorKind, RunEvent, RunStatus,
-    Step, WaitCondition,
+    Step, Target, WaitCondition,
 };
 use thiserror::Error;
 use tracing::{error, info, instrument, warn};
@@ -59,10 +59,18 @@ impl AdapterError {
         }
     }
 
-    fn timeout() -> Self {
+    pub fn timeout() -> Self {
         Self {
             public_message: "step timed out".to_string(),
             kind: RunErrorKind::Timeout,
+            diagnostics: None,
+        }
+    }
+
+    pub fn cancelled() -> Self {
+        Self {
+            public_message: "run cancelled".to_string(),
+            kind: RunErrorKind::Cancelled,
             diagnostics: None,
         }
     }
@@ -106,6 +114,26 @@ pub trait ExecutionAdapter {
         .map(|_| ConditionState::Satisfied)
     }
 
+    fn evaluate_wait_with_control(
+        &mut self,
+        condition: &WaitCondition,
+        config: &RunConfig,
+        _control: &RunControl,
+        _timeout: Option<Duration>,
+    ) -> Result<ConditionState, AdapterError> {
+        self.evaluate_wait(condition, config)
+    }
+
+    fn execute_with_control(
+        &mut self,
+        action: &Action,
+        config: &RunConfig,
+        _control: &RunControl,
+        _timeout: Option<Duration>,
+    ) -> Result<Vec<Artifact>, AdapterError> {
+        self.execute(action, config)
+    }
+
     fn evaluate_assertion(
         &mut self,
         assertion: &Assertion,
@@ -118,6 +146,55 @@ pub trait ExecutionAdapter {
             config,
         )
         .map(|_| true)
+    }
+
+    fn target_exists(
+        &mut self,
+        _target: &Target,
+        _config: &RunConfig,
+    ) -> Result<bool, AdapterError> {
+        Err(AdapterError::unsupported(
+            "semantic target queries are not supported by this adapter",
+        ))
+    }
+
+    fn invoke_target(&mut self, _target: &Target, _config: &RunConfig) -> Result<(), AdapterError> {
+        Err(AdapterError::unsupported(
+            "semantic target invocation is not supported by this adapter",
+        ))
+    }
+
+    fn set_target_text(
+        &mut self,
+        _target: &Target,
+        _text: &str,
+        _config: &RunConfig,
+    ) -> Result<(), AdapterError> {
+        Err(AdapterError::unsupported(
+            "semantic target text input is not supported by this adapter",
+        ))
+    }
+
+    fn target_is_focused(
+        &mut self,
+        _target: &Target,
+        _config: &RunConfig,
+    ) -> Result<bool, AdapterError> {
+        Err(AdapterError::unsupported(
+            "semantic target focus queries are not supported by this adapter",
+        ))
+    }
+
+    fn scroll_target(
+        &mut self,
+        _target: &Target,
+        _delta_x: i32,
+        _delta_y: i32,
+        _config: &RunConfig,
+    ) -> Result<(), AdapterError> {
+        Err(AdapterError::unsupported(
+            "semantic target scrolling is not supported by this adapter",
+        ))
     }
 
     fn preflight(&self, _action: &Action, _config: &RunConfig) -> Vec<PreflightDiagnostic> {
@@ -468,7 +545,8 @@ impl AutomationExecutor {
                     &step.conditions,
                     &action,
                     config,
-                    step.timeout,
+                    step.timeout
+                        .map(|timeout| Duration::from_millis(timeout.millis)),
                     control,
                     clock,
                 )
@@ -558,24 +636,51 @@ fn execute_action<A: ExecutionAdapter, C: ExecutionClock>(
     adapter: &mut A,
     action: &Action,
     config: &RunConfig,
-    timeout: Option<cueflow_core::DurationSpec>,
+    timeout: Option<Duration>,
     control: &RunControl,
     clock: &C,
 ) -> Result<Vec<Artifact>, AdapterError> {
     match action {
+        Action::ClickTarget { target } => {
+            adapter.invoke_target(target, config)?;
+            Ok(Vec::new())
+        }
+        Action::TypeText {
+            text,
+            target: Some(target),
+        } => {
+            adapter.set_target_text(target, text, config)?;
+            Ok(Vec::new())
+        }
+        Action::Scroll {
+            delta_x,
+            delta_y,
+            target: Some(target),
+        } => {
+            adapter.scroll_target(target, *delta_x, *delta_y, config)?;
+            Ok(Vec::new())
+        }
         Action::WaitFor { condition } => {
             wait_for_condition(adapter, condition, config, timeout, control, clock)?;
             Ok(Vec::new())
         }
         Action::Assert { assertion } => {
-            let passed = adapter.evaluate_assertion(assertion, config)?;
+            let passed = match assertion {
+                Assertion::TargetExists { target } if target.accessibility.is_some() => {
+                    adapter.target_exists(target, config)?
+                }
+                Assertion::Condition {
+                    condition: WaitCondition::WindowFocused { target },
+                } if target.accessibility.is_some() => adapter.target_is_focused(target, config)?,
+                _ => adapter.evaluate_assertion(assertion, config)?,
+            };
             if passed {
                 Ok(Vec::new())
             } else {
                 Err(AdapterError::assertion("assertion failed"))
             }
         }
-        _ => adapter.execute(action, config),
+        _ => adapter.execute_with_control(action, config, control, timeout),
     }
 }
 
@@ -584,49 +689,56 @@ fn execute_step<A: ExecutionAdapter, C: ExecutionClock>(
     conditions: &[WaitCondition],
     action: &Action,
     config: &RunConfig,
-    timeout: Option<cueflow_core::DurationSpec>,
+    timeout: Option<Duration>,
     control: &RunControl,
     clock: &C,
 ) -> Result<Vec<Artifact>, AdapterError> {
+    let started_at = clock.now();
     for condition in conditions {
         let condition = condition.for_platform(config.platform);
+        let timeout = remaining_timeout(timeout, started_at, clock)?;
         wait_for_condition(adapter, &condition, config, timeout, control, clock)?;
     }
+    let timeout = remaining_timeout(timeout, started_at, clock)?;
     execute_action(adapter, action, config, timeout, control, clock)
+}
+
+fn remaining_timeout<C: ExecutionClock>(
+    timeout: Option<Duration>,
+    started_at: Duration,
+    clock: &C,
+) -> Result<Option<Duration>, AdapterError> {
+    timeout
+        .map(|timeout| {
+            timeout
+                .checked_sub(clock.now().saturating_sub(started_at))
+                .ok_or_else(AdapterError::timeout)
+        })
+        .transpose()
 }
 
 fn wait_for_condition<A: ExecutionAdapter, C: ExecutionClock>(
     adapter: &mut A,
     condition: &WaitCondition,
     config: &RunConfig,
-    timeout: Option<cueflow_core::DurationSpec>,
+    timeout: Option<Duration>,
     control: &RunControl,
     clock: &C,
 ) -> Result<(), AdapterError> {
-    match condition {
-        WaitCondition::Duration { duration } => {
-            let requested = Duration::from_millis(duration.millis);
-            let timeout = timeout.map(|timeout| Duration::from_millis(timeout.millis));
-            let sleep_for = timeout.map_or(requested, |timeout| requested.min(timeout));
-            if !sleep_with_control(clock, control, sleep_for) {
-                return Err(AdapterError {
-                    public_message: "run cancelled".to_string(),
-                    kind: RunErrorKind::Cancelled,
-                    diagnostics: None,
-                });
-            }
-            if timeout.is_some_and(|timeout| requested > timeout) {
-                return Err(AdapterError::timeout());
-            }
-            return Ok(());
+    if let WaitCondition::Duration { duration } = condition {
+        let requested = Duration::from_millis(duration.millis);
+        let sleep_for = timeout.map_or(requested, |timeout| requested.min(timeout));
+        if !sleep_with_control(clock, control, sleep_for) {
+            return Err(AdapterError::cancelled());
         }
-        _ => {}
+        if timeout.is_some_and(|timeout| requested > timeout) {
+            return Err(AdapterError::timeout());
+        }
+        return Ok(());
     }
 
     let started_at = clock.now();
-    let timeout = timeout
-        .map(|timeout| Duration::from_millis(timeout.millis))
-        .unwrap_or(Duration::from_secs(30));
+    let timeout = timeout.unwrap_or(Duration::from_secs(30));
     loop {
         if control.is_cancelled() {
             return Err(AdapterError {
@@ -636,7 +748,29 @@ fn wait_for_condition<A: ExecutionAdapter, C: ExecutionClock>(
             });
         }
 
-        match adapter.evaluate_wait(condition, config)? {
+        let state = match condition {
+            WaitCondition::WindowExists { target } if target.accessibility.is_some() => {
+                if adapter.target_exists(target, config)? {
+                    ConditionState::Satisfied
+                } else {
+                    ConditionState::Pending
+                }
+            }
+            WaitCondition::WindowFocused { target } if target.accessibility.is_some() => {
+                if adapter.target_is_focused(target, config)? {
+                    ConditionState::Satisfied
+                } else {
+                    ConditionState::Pending
+                }
+            }
+            _ => adapter.evaluate_wait_with_control(
+                condition,
+                config,
+                control,
+                Some(timeout.saturating_sub(clock.now().saturating_sub(started_at))),
+            )?,
+        };
+        match state {
             ConditionState::Satisfied => return Ok(()),
             ConditionState::Pending => {}
         }
@@ -904,6 +1038,75 @@ mod tests {
         preflight_diagnostics: Vec<PreflightDiagnostic>,
     }
 
+    #[derive(Default)]
+    struct SemanticRecordingAdapter {
+        invoked_targets: usize,
+        text_targets: Vec<String>,
+        queried_targets: usize,
+        focused_targets: usize,
+        scroll_targets: Vec<(i32, i32)>,
+        execute_calls: usize,
+    }
+
+    impl ExecutionAdapter for SemanticRecordingAdapter {
+        fn execute(
+            &mut self,
+            _action: &Action,
+            _config: &RunConfig,
+        ) -> Result<Vec<Artifact>, AdapterError> {
+            self.execute_calls += 1;
+            Ok(Vec::new())
+        }
+
+        fn invoke_target(
+            &mut self,
+            _target: &Target,
+            _config: &RunConfig,
+        ) -> Result<(), AdapterError> {
+            self.invoked_targets += 1;
+            Ok(())
+        }
+
+        fn target_exists(
+            &mut self,
+            _target: &Target,
+            _config: &RunConfig,
+        ) -> Result<bool, AdapterError> {
+            self.queried_targets += 1;
+            Ok(true)
+        }
+
+        fn target_is_focused(
+            &mut self,
+            _target: &Target,
+            _config: &RunConfig,
+        ) -> Result<bool, AdapterError> {
+            self.focused_targets += 1;
+            Ok(true)
+        }
+
+        fn scroll_target(
+            &mut self,
+            _target: &Target,
+            delta_x: i32,
+            delta_y: i32,
+            _config: &RunConfig,
+        ) -> Result<(), AdapterError> {
+            self.scroll_targets.push((delta_x, delta_y));
+            Ok(())
+        }
+
+        fn set_target_text(
+            &mut self,
+            _target: &Target,
+            text: &str,
+            _config: &RunConfig,
+        ) -> Result<(), AdapterError> {
+            self.text_targets.push(text.to_string());
+            Ok(())
+        }
+    }
+
     impl ExecutionAdapter for QueryAdapter {
         fn execute(
             &mut self,
@@ -1089,6 +1292,119 @@ mod tests {
             report.events[1],
             RunEvent::StepStarted { ref step_kind, .. } if step_kind == "launchApp"
         ));
+    }
+
+    #[test]
+    fn semantic_actions_use_explicit_adapter_operations() {
+        let executor = AutomationExecutor::new();
+        let mut definition = definition();
+        definition.steps = vec![
+            Step {
+                id: "click".to_string(),
+                label: None,
+                action: Action::ClickTarget {
+                    target: Target::app("Browser"),
+                },
+                timeout: None,
+                retry: RetryPolicy::default(),
+                on_error: OnErrorPolicy::Stop,
+                conditions: Vec::new(),
+                platform_overrides: Vec::new(),
+            },
+            Step {
+                id: "type".to_string(),
+                label: None,
+                action: Action::TypeText {
+                    text: "Cueflow".to_string(),
+                    target: Some(Target::app("Browser")),
+                },
+                timeout: None,
+                retry: RetryPolicy::default(),
+                on_error: OnErrorPolicy::Stop,
+                conditions: Vec::new(),
+                platform_overrides: Vec::new(),
+            },
+            Step {
+                id: "assert".to_string(),
+                label: None,
+                action: Action::Assert {
+                    assertion: Assertion::TargetExists {
+                        target: Target {
+                            app_name: None,
+                            process_name: None,
+                            window_title: Some("Demo".to_string()),
+                            title_contains: None,
+                            url: None,
+                            file_path: None,
+                            accessibility: Some(cueflow_core::AccessibilityTarget {
+                                id: Some("submit".to_string()),
+                                name: None,
+                                control_type: None,
+                            }),
+                            image: None,
+                            coordinates: None,
+                            platform_selectors: Default::default(),
+                        },
+                    },
+                },
+                timeout: None,
+                retry: RetryPolicy::default(),
+                on_error: OnErrorPolicy::Stop,
+                conditions: Vec::new(),
+                platform_overrides: Vec::new(),
+            },
+            Step {
+                id: "scroll".to_string(),
+                label: None,
+                action: Action::Scroll {
+                    delta_x: 0,
+                    delta_y: -1,
+                    target: Some(Target::app("Browser")),
+                },
+                timeout: None,
+                retry: RetryPolicy::default(),
+                on_error: OnErrorPolicy::Stop,
+                conditions: vec![WaitCondition::WindowFocused {
+                    target: Target {
+                        app_name: None,
+                        process_name: None,
+                        window_title: Some("Demo".to_string()),
+                        title_contains: None,
+                        url: None,
+                        file_path: None,
+                        accessibility: Some(cueflow_core::AccessibilityTarget {
+                            id: Some("submit".to_string()),
+                            name: None,
+                            control_type: None,
+                        }),
+                        image: None,
+                        coordinates: None,
+                        platform_selectors: Default::default(),
+                    },
+                }],
+                platform_overrides: Vec::new(),
+            },
+        ];
+        let mut adapter = SemanticRecordingAdapter::default();
+
+        let report = executor
+            .run(
+                &definition,
+                RunConfig {
+                    dry_run: false,
+                    ..RunConfig::default()
+                },
+                &mut adapter,
+            )
+            .expect("semantic actions succeed");
+
+        assert_eq!(report.outcome, RunOutcome::Succeeded);
+        assert_eq!(adapter.invoked_targets, 1);
+        assert_eq!(adapter.text_targets, vec!["Cueflow"]);
+        assert_eq!(adapter.queried_targets, 1);
+        assert_eq!(adapter.focused_targets, 1);
+        assert_eq!(adapter.scroll_targets, vec![(0, -1)]);
+        assert_eq!(adapter.execute_calls, 0);
     }
 
     #[test]
