@@ -1,0 +1,20 @@
+{
+  "id": "windows-missing-window-timeout-drill",
+  "title": "Windows missing window timeout drill",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "wait-missing-window",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "windowExists",
+        "target": {
+          "windowTitle": "Cueflow Missing Window Drill 8E6F0A6A-7A8F-44DF-84D8-5F79B4A7412E"
+        }
+      },
+      "timeout": {
+        "millis": 250
+      }
+    }
+  ]
+}

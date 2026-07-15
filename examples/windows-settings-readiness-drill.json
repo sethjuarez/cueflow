@@ -52,6 +52,23 @@
       }
     },
     {
+      "id": "wait-root-actionable",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "targetActionable",
+        "target": {
+          "windowTitle": "Settings",
+          "accessibility": {
+            "path": [],
+            "controlType": "window"
+          }
+        }
+      },
+      "timeout": {
+        "millis": 5000
+      }
+    },
+    {
       "id": "assert-root-name",
       "kind": "assert",
       "assertion": {

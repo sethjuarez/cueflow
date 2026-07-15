@@ -7,14 +7,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
-    AccessibilityBounds, AccessibilityNode, AccessibilitySelectorCandidate, AccessibilityTree,
-    AdapterCapabilities, SelectorConfidence,
+    AccessibilityBounds, AccessibilityNode, AccessibilityPoint, AccessibilitySelectorCandidate,
+    AccessibilityTree, AdapterCapabilities, SelectorConfidence, SelectorRepairReport,
+    WindowIdentity,
 };
 use cueflow_core::{
-    Action, Artifact, Assertion, Platform, PreflightDiagnostic, PreflightSeverity, RunConfig,
-    Target, WaitCondition,
+    Action, Artifact, Assertion, FailureKind, Platform, PreflightDiagnostic, PreflightSeverity,
+    RunConfig, Target, WaitCondition,
 };
-use cueflow_executor::{AdapterError, ConditionState, ExecutionAdapter, RunControl};
+use cueflow_executor::{AdapterError, ConditionState, EvidencePhase, ExecutionAdapter, RunControl};
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HWND, INVALID_HANDLE_VALUE, LPARAM, RECT, RPC_E_CHANGED_MODE},
@@ -49,8 +50,9 @@ use windows::{
             },
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
-                EnumWindows, GetDesktopWindow, GetForegroundWindow, GetSystemMetrics,
-                GetWindowTextLengthW, GetWindowTextW, IsWindowVisible, SM_CXSCREEN, SM_CYSCREEN,
+                EnumWindows, GW_OWNER, GetClassNameW, GetDesktopWindow, GetForegroundWindow,
+                GetSystemMetrics, GetWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+                GetWindowThreadProcessId, IsIconic, IsWindowVisible, SM_CXSCREEN, SM_CYSCREEN,
                 SW_SHOWNORMAL, SetCursorPos, SetForegroundWindow,
             },
         },
@@ -97,6 +99,7 @@ impl WindowsDesktopAdapter {
     ) -> Result<AccessibilityTree, AdapterError> {
         let window = find_window(target)?;
         let window_title = window_title(window)?;
+        let window_identity = window_identity(window);
         let selector = window_target_summary(target);
         let max_nodes = max_nodes.max(1);
 
@@ -140,6 +143,7 @@ impl WindowsDesktopAdapter {
             Ok(AccessibilityTree {
                 platform: Platform::Windows,
                 window_title,
+                window: window_identity,
                 selector,
                 max_depth,
                 max_nodes,
@@ -160,6 +164,91 @@ impl WindowsDesktopAdapter {
     pub fn capture_screenshot(&self, path: impl AsRef<Path>) -> Result<Artifact, AdapterError> {
         capture_desktop_screenshot(path.as_ref())
     }
+
+    pub fn capture_window_screenshot(
+        &self,
+        target: &Target,
+        path: impl AsRef<Path>,
+    ) -> Result<Artifact, AdapterError> {
+        let window = find_window(target)?;
+        capture_window_screenshot(window, path.as_ref())
+    }
+
+    pub fn repair_selector(
+        &self,
+        target: &Target,
+        max_depth: u32,
+        max_nodes: usize,
+    ) -> Result<SelectorRepairReport, AdapterError> {
+        let tree = self.inspect_window_with_options(target, max_depth, max_nodes, false)?;
+        let matched = if target.accessibility.is_some() {
+            semantic_target_exists(target).unwrap_or(false)
+        } else {
+            true
+        };
+        let mut candidates = Vec::new();
+        collect_repair_candidates(&tree.root, target.accessibility.as_ref(), &mut candidates);
+        candidates.sort_by(|left, right| right.score.cmp(&left.score));
+        let mut seen_targets = std::collections::BTreeSet::new();
+        candidates.retain(|candidate| {
+            serde_json::to_string(&candidate.target)
+                .map(|target| seen_targets.insert(target))
+                .unwrap_or(true)
+        });
+        candidates.truncate(20);
+        Ok(SelectorRepairReport {
+            original: target.clone(),
+            matched,
+            candidates,
+            diagnostics: vec![format!(
+                "inspected {} with maxDepth={} maxNodes={} truncated={}",
+                tree.window_title, tree.max_depth, tree.max_nodes, tree.truncated
+            )],
+        })
+    }
+}
+
+fn collect_repair_candidates(
+    node: &AccessibilityNode,
+    desired: Option<&cueflow_core::AccessibilityTarget>,
+    candidates: &mut Vec<AccessibilitySelectorCandidate>,
+) {
+    for candidate in &node.selector_candidates {
+        if repair_candidate_matches(candidate, desired) {
+            candidates.push(candidate.clone());
+        }
+    }
+    for child in &node.children {
+        collect_repair_candidates(child, desired, candidates);
+    }
+}
+
+fn repair_candidate_matches(
+    candidate: &AccessibilitySelectorCandidate,
+    desired: Option<&cueflow_core::AccessibilityTarget>,
+) -> bool {
+    let Some(desired) = desired else {
+        return true;
+    };
+    let Some(accessibility) = &candidate.target.accessibility else {
+        return false;
+    };
+    desired
+        .id
+        .as_ref()
+        .is_some_and(|id| accessibility.id.as_ref() == Some(id))
+        || desired
+            .name
+            .as_ref()
+            .is_some_and(|name| accessibility.name.as_ref() == Some(name))
+        || desired
+            .control_type
+            .as_ref()
+            .is_some_and(|control_type| accessibility.control_type.as_ref() == Some(control_type))
+        || desired.id.is_none()
+            && desired.name.is_none()
+            && desired.control_type.is_none()
+            && accessibility.path.is_some()
 }
 
 fn window_search_diagnostics(target: &Target, windows: &[HWND]) -> String {
@@ -167,9 +256,30 @@ fn window_search_diagnostics(target: &Target, windows: &[HWND]) -> String {
         .iter()
         .take(8)
         .filter_map(|window| {
-            window_title(*window)
-                .ok()
-                .map(|title| format!("{} ({window:?})", quote(&title)))
+            window_identity(*window).map(|identity| {
+                format!(
+                    "{} (handle={}, class={}, pid={}, process={}, bounds={}, foreground={}, minimized={}, owner={})",
+                    quote(&identity.title),
+                    identity.handle,
+                    quote(&identity.class_name),
+                    identity.process_id,
+                    identity
+                        .process_name
+                        .as_deref()
+                        .map(quote)
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    identity
+                        .bounds
+                        .map(|bounds| format!(
+                            "{},{},{},{}",
+                            bounds.left, bounds.top, bounds.right, bounds.bottom
+                        ))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    identity.is_foreground,
+                    identity.is_minimized,
+                    identity.owner.as_deref().unwrap_or("none")
+                )
+            })
         })
         .collect::<Vec<_>>();
     format!(
@@ -207,34 +317,89 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
         config: &RunConfig,
     ) -> Result<Vec<Artifact>, AdapterError> {
         match action {
-            Action::LaunchUrl { url, .. } => shell_open(url),
-            Action::LaunchApp { app, .. } => shell_open(app),
-            Action::FocusWindow { target } => focus_window(target).map(|_| Vec::new()),
+            Action::LaunchUrl {
+                url,
+                target: Some(target),
+            } => {
+                reject_unsupported_target(unsupported_launch_target_reason(target, config))?;
+                shell_open(url)
+            }
+            Action::LaunchUrl { url, target: None } => shell_open(url),
+            Action::LaunchApp {
+                app,
+                target: Some(target),
+            } => {
+                reject_unsupported_target(unsupported_launch_target_reason(target, config))?;
+                shell_open(app)
+            }
+            Action::LaunchApp { app, target: None } => shell_open(app),
+            Action::FocusWindow { target } => {
+                reject_unsupported_target(unsupported_window_target_reason_with_config(
+                    target, config,
+                ))?;
+                focus_window(target).map(|_| Vec::new())
+            }
             Action::TypeText {
                 text,
                 target: Some(target),
-            } => self
-                .set_target_text(target, text, config)
-                .map(|_| Vec::new()),
+            } => {
+                reject_unsupported_target(unsupported_semantic_target_reason_with_config(
+                    target, config,
+                ))?;
+                self.set_target_text(target, text, config)
+                    .map(|_| Vec::new())
+            }
             Action::TypeText { text, target: None } => send_text(text).map(|_| Vec::new()),
             Action::PressKey {
                 keys,
                 target: Some(target),
-            } => focus_target(target, config)
-                .and_then(|_| send_key_chord(keys))
-                .map(|_| Vec::new()),
+            } => {
+                reject_unsupported_target(unsupported_semantic_target_reason_with_config(
+                    target, config,
+                ))?;
+                focus_target(target, config)
+                    .and_then(|_| send_key_chord(keys))
+                    .map(|_| Vec::new())
+            }
             Action::PressKey { keys, target: None } => send_key_chord(keys).map(|_| Vec::new()),
-            Action::Scroll { delta_y, .. } => send_scroll(*delta_y).map(|_| Vec::new()),
+            Action::Scroll {
+                delta_y,
+                target: Some(target),
+                ..
+            } => {
+                reject_unsupported_target(unsupported_semantic_target_reason_with_config(
+                    target, config,
+                ))?;
+                focus_target(target, config)
+                    .and_then(|_| send_scroll(*delta_y))
+                    .map(|_| Vec::new())
+            }
+            Action::Scroll {
+                delta_y,
+                target: None,
+                ..
+            } => send_scroll(*delta_y).map(|_| Vec::new()),
             Action::ClickTarget { target } if target.coordinates.is_some() => {
+                reject_unsupported_target(unsupported_coordinate_target_reason(target, config))?;
                 click_coordinates(target).map(|_| Vec::new())
             }
             Action::ClickTarget { target } => {
+                reject_unsupported_target(unsupported_semantic_target_reason_with_config(
+                    target, config,
+                ))?;
                 self.invoke_target(target, config).map(|_| Vec::new())
             }
             Action::RunCommand { command, args } => {
                 run_command(command, args, config, &RunControl::default(), None).map(|_| Vec::new())
             }
-            Action::OpenFile { path, .. } => shell_open_file(path),
+            Action::OpenFile {
+                path,
+                target: Some(target),
+            } => {
+                reject_unsupported_target(unsupported_launch_target_reason(target, config))?;
+                shell_open_file(path)
+            }
+            Action::OpenFile { path, target: None } => shell_open_file(path),
             _ => Err(AdapterError::unsupported(format!(
                 "Windows adapter does not yet support {}",
                 action.kind()
@@ -287,6 +452,9 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
             }
             WaitCondition::TargetVisible { target } => {
                 semantic_target_visible(target).map(condition_state)
+            }
+            WaitCondition::TargetActionable { target } => {
+                semantic_target_actionable(target).map(condition_state)
             }
             WaitCondition::TargetNotExists { target } => {
                 semantic_target_exists(target).map(|exists| condition_state(!exists))
@@ -351,6 +519,14 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
             Action::RunCommand { command, args } => {
                 run_command(command, args, config, control, timeout).map(|_| Vec::new())
             }
+            Action::LaunchUrl {
+                url,
+                target: Some(target),
+            } => launch_and_wait_for_window(url, target, config, control, timeout),
+            Action::LaunchApp {
+                app,
+                target: Some(target),
+            } => launch_and_wait_for_window(app, target, config, control, timeout),
             _ => self.execute(action, config),
         }
     }
@@ -379,7 +555,14 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
         semantic_target_exists(target)
     }
 
-    fn invoke_target(&mut self, target: &Target, _config: &RunConfig) -> Result<(), AdapterError> {
+    fn invoke_target(&mut self, target: &Target, config: &RunConfig) -> Result<(), AdapterError> {
+        if target.coordinates.is_some() {
+            reject_unsupported_target(unsupported_coordinate_target_reason(target, config))?;
+            return click_coordinates(target);
+        }
+        reject_unsupported_target(unsupported_semantic_target_reason_with_config(
+            target, config,
+        ))?;
         with_semantic_target(target, |element| {
             ensure_semantic_target_actionable(element)?;
             let pattern = unsafe {
@@ -397,8 +580,11 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
         &mut self,
         target: &Target,
         text: &str,
-        _config: &RunConfig,
+        config: &RunConfig,
     ) -> Result<(), AdapterError> {
+        reject_unsupported_target(unsupported_semantic_target_reason_with_config(
+            target, config,
+        ))?;
         with_semantic_target(target, |element| {
             ensure_semantic_target_actionable(element)?;
             let pattern = unsafe {
@@ -425,8 +611,11 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
         target: &Target,
         delta_x: i32,
         delta_y: i32,
-        _config: &RunConfig,
+        config: &RunConfig,
     ) -> Result<(), AdapterError> {
+        reject_unsupported_target(unsupported_semantic_target_reason_with_config(
+            target, config,
+        ))?;
         with_semantic_target(target, |element| {
             ensure_semantic_target_actionable(element)?;
             let pattern = unsafe {
@@ -450,6 +639,154 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
             })
             .unwrap_or_default()
     }
+
+    fn capture_step_evidence(
+        &mut self,
+        phase: EvidencePhase,
+        action: &Action,
+        config: &RunConfig,
+        run_id: &str,
+        automation_id: &str,
+        step_id: &str,
+    ) -> Result<Vec<Artifact>, AdapterError> {
+        if !config.capture_step_evidence {
+            return Ok(Vec::new());
+        }
+        reject_unsupported_target(unsupported_action_reason(action, config))?;
+        let Some(directory) = &config.evidence_directory else {
+            return Ok(Vec::new());
+        };
+        let Some(target) = evidence_target(action) else {
+            return Ok(Vec::new());
+        };
+        if target.window_title.is_none() && target.title_contains.is_none() {
+            return Ok(Vec::new());
+        }
+
+        let evidence_dir = Path::new(directory).join("steps").join(step_id);
+        let safe_run_id = safe_artifact_component(run_id);
+        let safe_automation_id = safe_artifact_component(automation_id);
+        let tree_path = evidence_dir.join(format!(
+            "{safe_automation_id}-{safe_run_id}-{step_id}-{}-accessibility.json",
+            phase.as_str()
+        ));
+        let tree = self.inspect_window_with_options(target, 3, 300, config.allow_value_capture)?;
+        let tree_json =
+            serde_json::to_string_pretty(&tree).expect("accessibility evidence serializes");
+        enforce_evidence_artifact_size(tree_json.len() as u64, config)?;
+
+        let screenshot_path = if config.allow_screenshot_capture {
+            Some(evidence_dir.join(format!(
+                "{safe_automation_id}-{safe_run_id}-{step_id}-{}-window.bmp",
+                phase.as_str()
+            )))
+        } else {
+            None
+        };
+        let screenshot_window = if config.allow_screenshot_capture {
+            let window = find_window(target)?;
+            enforce_evidence_artifact_size(window_screenshot_bmp_size(window)?, config)?;
+            Some(window)
+        } else {
+            None
+        };
+
+        fs::create_dir_all(&evidence_dir)
+            .map_err(|_| AdapterError::new("Windows could not create step evidence directory"))?;
+        let screenshot = if let (Some(window), Some(screenshot_path)) =
+            (screenshot_window, screenshot_path.as_ref())
+        {
+            Some(capture_window_screenshot_with_limit(
+                window,
+                screenshot_path,
+                Some(config),
+            )?)
+        } else {
+            None
+        };
+        fs::write(&tree_path, tree_json)
+            .map_err(|_| AdapterError::new("Windows could not write accessibility evidence"))?;
+
+        let mut artifacts = vec![Artifact {
+            kind: cueflow_core::ArtifactKind::AccessibilityTree,
+            uri: format!(
+                "file://{}",
+                strip_verbatim_path_prefix(&path_display(&tree_path))
+            ),
+            label: Some(format!("{} accessibility tree: {step_id}", phase.as_str())),
+        }];
+
+        if let Some(screenshot) = screenshot {
+            artifacts.push(screenshot);
+        }
+
+        Ok(artifacts)
+    }
+}
+
+const DEFAULT_EVIDENCE_MAX_ARTIFACT_BYTES: u64 = 25 * 1024 * 1024;
+
+fn enforce_evidence_artifact_size(size: u64, config: &RunConfig) -> Result<(), AdapterError> {
+    let limit = config
+        .evidence_max_artifact_bytes
+        .unwrap_or(DEFAULT_EVIDENCE_MAX_ARTIFACT_BYTES);
+    if size > limit {
+        return Err(AdapterError::new(format!(
+            "evidence artifact exceeded configured size limit ({size} > {limit} bytes)"
+        ))
+        .with_failure_kind(FailureKind::PolicyDenied)
+        .with_source("failureKind=policyDenied"));
+    }
+    Ok(())
+}
+
+fn evidence_target(action: &Action) -> Option<&Target> {
+    match action {
+        Action::LaunchUrl { target, .. }
+        | Action::LaunchApp { target, .. }
+        | Action::TypeText { target, .. }
+        | Action::PressKey { target, .. }
+        | Action::Scroll { target, .. } => target.as_ref(),
+        Action::FocusWindow { target } | Action::ClickTarget { target } => Some(target),
+        Action::WaitFor { condition } => condition_target(condition),
+        Action::Assert {
+            assertion: Assertion::TargetExists { target },
+        } => Some(target),
+        Action::Assert {
+            assertion: Assertion::Condition { condition },
+        } => condition_target(condition),
+        _ => None,
+    }
+}
+
+fn condition_target(condition: &WaitCondition) -> Option<&Target> {
+    match condition {
+        WaitCondition::WindowExists { target }
+        | WaitCondition::WindowFocused { target }
+        | WaitCondition::ProcessRunning { target }
+        | WaitCondition::TargetExists { target }
+        | WaitCondition::TargetFocused { target }
+        | WaitCondition::TargetEnabled { target }
+        | WaitCondition::TargetVisible { target }
+        | WaitCondition::TargetActionable { target }
+        | WaitCondition::TargetNotExists { target }
+        | WaitCondition::TargetNameContains { target, .. }
+        | WaitCondition::TargetValueContains { target, .. } => Some(target),
+        _ => None,
+    }
+}
+
+fn safe_artifact_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn send_text(text: &str) -> Result<(), AdapterError> {
@@ -607,12 +944,48 @@ fn shell_open(target: &str) -> Result<Vec<Artifact>, AdapterError> {
     let target = HSTRING::from(target);
     let result = unsafe { ShellExecuteW(None, None, &target, None, None, SW_SHOWNORMAL) };
     if result.0 as isize <= 32 {
-        return Err(AdapterError::new(
-            "Windows could not open the requested target",
-        ));
+        return Err(
+            AdapterError::new("Windows could not open the requested target")
+                .with_failure_kind(FailureKind::Transient),
+        );
     }
 
     Ok(Vec::new())
+}
+
+fn launch_and_wait_for_window(
+    launch_target: &str,
+    window_target: &Target,
+    config: &RunConfig,
+    control: &RunControl,
+    timeout: Option<Duration>,
+) -> Result<Vec<Artifact>, AdapterError> {
+    if let Some(reason) = unsupported_launch_target_reason(window_target, config) {
+        return Err(AdapterError::unsupported(reason).with_failure_kind(FailureKind::PolicyDenied));
+    }
+    let artifacts = shell_open(launch_target)?;
+    let timeout = timeout.unwrap_or(Duration::from_secs(5));
+    let started_at = Instant::now();
+    let mut last_error = None;
+    while started_at.elapsed() < timeout {
+        if control.is_cancelled() {
+            return Err(AdapterError::cancelled());
+        }
+        match find_window(window_target) {
+            Ok(_) => return Ok(artifacts),
+            Err(error)
+                if matches!(
+                    error.failure_kind(),
+                    Some(FailureKind::NotFound | FailureKind::Ambiguous)
+                ) =>
+            {
+                last_error = Some(error);
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(AdapterError::timeout))
 }
 
 fn shell_open_file(path: &str) -> Result<Vec<Artifact>, AdapterError> {
@@ -711,6 +1084,114 @@ fn capture_desktop_screenshot(path: &Path) -> Result<Artifact, AdapterError> {
     result
 }
 
+fn window_screenshot_bmp_size(window: HWND) -> Result<u64, AdapterError> {
+    let rect = window_bounds(window)
+        .ok_or_else(|| AdapterError::new("Windows could not determine window bounds"))?;
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return Err(AdapterError::new(
+            "Windows window has empty screenshot bounds",
+        ));
+    }
+    bmp_file_size(width, height)
+}
+
+fn capture_window_screenshot(window: HWND, path: &Path) -> Result<Artifact, AdapterError> {
+    capture_window_screenshot_with_limit(window, path, None)
+}
+
+fn capture_window_screenshot_with_limit(
+    window: HWND,
+    path: &Path,
+    evidence_config: Option<&RunConfig>,
+) -> Result<Artifact, AdapterError> {
+    let rect = window_bounds(window)
+        .ok_or_else(|| AdapterError::new("Windows could not determine window bounds"))?;
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width <= 0 || height <= 0 {
+        return Err(AdapterError::new(
+            "Windows window has empty screenshot bounds",
+        ));
+    }
+    if let Some(config) = evidence_config {
+        enforce_evidence_artifact_size(bmp_file_size(width, height)?, config)?;
+    }
+    let window_dc = unsafe { GetWindowDC(Some(window)) };
+    if window_dc.is_invalid() {
+        return Err(AdapterError::new(
+            "Windows could not acquire the window device context",
+        ));
+    }
+
+    let result = (|| {
+        let memory_dc = unsafe { CreateCompatibleDC(Some(window_dc)) };
+        if memory_dc.is_invalid() {
+            return Err(AdapterError::new(
+                "Windows could not create a window screenshot device context",
+            ));
+        }
+        let bitmap = unsafe { CreateCompatibleBitmap(window_dc, width, height) };
+        if bitmap.is_invalid() {
+            unsafe {
+                let _ = DeleteDC(memory_dc);
+            }
+            return Err(AdapterError::new(
+                "Windows could not create a window screenshot bitmap",
+            ));
+        }
+
+        let previous_object = unsafe { SelectObject(memory_dc, bitmap.into()) };
+        if previous_object.is_invalid() {
+            unsafe {
+                let _ = DeleteObject(bitmap.into());
+                let _ = DeleteDC(memory_dc);
+            }
+            return Err(AdapterError::new(
+                "Windows could not select the window screenshot bitmap",
+            ));
+        }
+
+        let result = (|| {
+            unsafe {
+                BitBlt(
+                    memory_dc,
+                    0,
+                    0,
+                    width,
+                    height,
+                    Some(window_dc),
+                    0,
+                    0,
+                    SRCCOPY,
+                )
+                .map_err(|_| AdapterError::new("Windows could not capture the window"))?;
+            }
+
+            let pixels = bitmap_pixels(memory_dc, bitmap, width, height)?;
+            write_bmp(path, width, height, &pixels)?;
+            Ok(Artifact {
+                kind: cueflow_core::ArtifactKind::Screenshot,
+                uri: format!("file://{}", strip_verbatim_path_prefix(&path_display(path))),
+                label: Some("Window screenshot".to_string()),
+            })
+        })();
+
+        unsafe {
+            let _ = SelectObject(memory_dc, previous_object);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(memory_dc);
+        }
+        result
+    })();
+
+    unsafe {
+        let _ = ReleaseDC(Some(window), window_dc);
+    }
+    result
+}
+
 fn bitmap_pixels(
     memory_dc: windows::Win32::Graphics::Gdi::HDC,
     bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
@@ -749,6 +1230,20 @@ fn bitmap_pixels(
         ));
     }
     Ok(pixels)
+}
+
+fn bmp_file_size(width: i32, height: i32) -> Result<u64, AdapterError> {
+    let width = u64::try_from(width)
+        .map_err(|_| AdapterError::new("Windows screenshot width is invalid"))?;
+    let height = u64::try_from(height)
+        .map_err(|_| AdapterError::new("Windows screenshot height is invalid"))?;
+    let pixels = width
+        .checked_mul(height)
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| AdapterError::new("Windows screenshot size overflowed"))?;
+    (14u64 + 40u64)
+        .checked_add(pixels)
+        .ok_or_else(|| AdapterError::new("Windows screenshot size overflowed"))
 }
 
 fn write_bmp(path: &Path, width: i32, height: i32, pixels: &[u8]) -> Result<(), AdapterError> {
@@ -807,15 +1302,17 @@ fn wait_for_foreground(window: HWND, label: &str) -> Result<(), AdapterError> {
         }
         thread::sleep(Duration::from_millis(25));
     }
-    Err(AdapterError::new(format!(
-        "Windows did not foreground the {label}"
-    )))
+    Err(
+        AdapterError::new(format!("Windows did not foreground the {label}"))
+            .with_failure_kind(FailureKind::FocusDenied)
+            .with_source("failureKind=focusDenied"),
+    )
 }
 
 fn window_exists(target: &Target) -> Result<bool, AdapterError> {
     match find_window(target) {
         Ok(_) => Ok(true),
-        Err(error) if has_failure_kind(&error, "notFound") => Ok(false),
+        Err(error) if has_failure_kind(&error, FailureKind::NotFound) => Ok(false),
         Err(error) => Err(error),
     }
 }
@@ -823,7 +1320,7 @@ fn window_exists(target: &Target) -> Result<bool, AdapterError> {
 fn window_is_focused(target: &Target) -> Result<bool, AdapterError> {
     let window = match find_window(target) {
         Ok(window) => window,
-        Err(error) if has_failure_kind(&error, "notFound") => return Ok(false),
+        Err(error) if has_failure_kind(&error, FailureKind::NotFound) => return Ok(false),
         Err(error) => return Err(error),
     };
 
@@ -888,6 +1385,7 @@ fn focus_target(target: &Target, _config: &RunConfig) -> Result<(), AdapterError
             Err(AdapterError::new(
                 "Windows did not give keyboard focus to the requested semantic target",
             )
+            .with_failure_kind(FailureKind::FocusDenied)
             .with_source("failureKind=focusDenied"))
         }
     })
@@ -942,11 +1440,15 @@ fn element_summary(element: &IUIAutomationElement, path: &[u32]) -> Result<Strin
             .map_err(|_| AdapterError::new("Windows could read a target control type"))?
     };
     Ok(format!(
-        "path={}, id={}, name={}, controlType={}",
+        "path={}, id={}, name={}, controlType={}, clickPoint={}",
         format_accessibility_path(path),
         quote(&id.to_string()),
         quote(&name.to_string()),
-        quote(&control_type.to_string())
+        quote(&control_type.to_string()),
+        current_bounds(element)
+            .and_then(click_point_for_bounds)
+            .map(|point| format!("{},{}", point.x, point.y))
+            .unwrap_or_else(|| "unknown".to_string())
     ))
 }
 
@@ -1129,15 +1631,16 @@ fn find_window(target: &Target) -> Result<HWND, AdapterError> {
     }
 
     match search.matches.as_slice() {
-        [] => Err(
-            AdapterError::new("requested window was not found").with_source(format!(
+        [] => Err(AdapterError::new("requested window was not found")
+            .with_failure_kind(FailureKind::NotFound)
+            .with_source(format!(
                 "failureKind=notFound; {}",
                 window_search_diagnostics(target, &search.matches)
-            )),
-        ),
+            ))),
         [window] => Ok(*window),
         _ => Err(
             AdapterError::new("requested window selector matched multiple visible windows")
+                .with_failure_kind(FailureKind::Ambiguous)
                 .with_source(format!(
                     "failureKind=ambiguous; {}",
                     window_search_diagnostics(target, &search.matches)
@@ -1243,6 +1746,85 @@ fn window_title(window: HWND) -> Result<String, AdapterError> {
     Ok(String::from_utf16_lossy(&buffer[..copied as usize]))
 }
 
+fn window_identity(window: HWND) -> Option<WindowIdentity> {
+    let title = window_title(window).ok()?;
+    let mut class_buffer = vec![0; 256];
+    let class_length = unsafe { GetClassNameW(window, &mut class_buffer) };
+    let class_name = if class_length == 0 {
+        String::new()
+    } else {
+        String::from_utf16_lossy(&class_buffer[..class_length as usize])
+    };
+
+    let mut process_id = 0;
+    unsafe {
+        GetWindowThreadProcessId(window, Some(&mut process_id));
+    }
+    let bounds = window_bounds(window);
+
+    Some(WindowIdentity {
+        handle: format!("{window:?}"),
+        title,
+        class_name,
+        process_id,
+        process_name: process_name_by_id(process_id).ok().flatten(),
+        bounds,
+        is_foreground: unsafe { GetForegroundWindow() == window },
+        is_minimized: unsafe { IsIconic(window).as_bool() },
+        owner: window_owner(window).map(|owner| format!("{owner:?}")),
+    })
+}
+
+fn window_owner(window: HWND) -> Option<HWND> {
+    let owner = unsafe { GetWindow(window, GW_OWNER) }.ok()?;
+    (owner.0 != std::ptr::null_mut()).then_some(owner)
+}
+
+fn window_bounds(window: HWND) -> Option<AccessibilityBounds> {
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(window, &mut rect) }.ok()?;
+    Some(AccessibilityBounds {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    })
+}
+
+fn process_name_by_id(process_id: u32) -> Result<Option<String>, AdapterError> {
+    if process_id == 0 {
+        return Ok(None);
+    }
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+        .map_err(|_| AdapterError::new("Windows could not enumerate processes"))?;
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(AdapterError::new("Windows could not enumerate processes"));
+    }
+
+    let result = (|| {
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if unsafe { Process32FirstW(snapshot, &mut entry) }.is_err() {
+            return Ok(None);
+        }
+
+        loop {
+            if entry.th32ProcessID == process_id {
+                return Ok(Some(process_entry_name(&entry)));
+            }
+            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+                return Ok(None);
+            }
+        }
+    })();
+    unsafe {
+        CloseHandle(snapshot).ok();
+    }
+    result
+}
+
 fn semantic_target_exists(target: &Target) -> Result<bool, AdapterError> {
     match with_semantic_target(target, |_| Ok(())) {
         Ok(()) => Ok(true),
@@ -1259,9 +1841,9 @@ fn ensure_semantic_target_actionable(element: &IUIAutomationElement) -> Result<(
             .as_bool()
     };
     if !enabled {
-        return Err(
-            AdapterError::new("semantic target is disabled").with_source("failureKind=disabled")
-        );
+        return Err(AdapterError::new("semantic target is disabled")
+            .with_failure_kind(FailureKind::Disabled)
+            .with_source("failureKind=disabled"));
     }
 
     let offscreen = unsafe {
@@ -1271,9 +1853,20 @@ fn ensure_semantic_target_actionable(element: &IUIAutomationElement) -> Result<(
             .as_bool()
     };
     if offscreen {
-        return Err(
-            AdapterError::new("semantic target is offscreen").with_source("failureKind=offscreen")
-        );
+        return Err(AdapterError::new("semantic target is offscreen")
+            .with_failure_kind(FailureKind::Offscreen)
+            .with_source("failureKind=offscreen"));
+    }
+
+    let bounds = unsafe {
+        element
+            .CurrentBoundingRectangle()
+            .map_err(|_| AdapterError::new("Windows could not verify target bounds"))?
+    };
+    if bounds.right <= bounds.left || bounds.bottom <= bounds.top {
+        return Err(AdapterError::new("semantic target has empty bounds")
+            .with_failure_kind(FailureKind::Offscreen)
+            .with_source("failureKind=offscreen; bounds=empty"));
     }
 
     Ok(())
@@ -1318,6 +1911,34 @@ fn semantic_target_visible(target: &Target) -> Result<bool, AdapterError> {
     })
 }
 
+fn semantic_target_actionable(target: &Target) -> Result<bool, AdapterError> {
+    semantic_target_readiness(target, |element| unsafe {
+        let offscreen = element
+            .CurrentIsOffscreen()
+            .map_err(|_| AdapterError::new("Windows could read semantic target visibility state"))?
+            .as_bool();
+        if offscreen {
+            return Ok(false);
+        }
+        let control_type = element
+            .CurrentLocalizedControlType()
+            .map_err(|_| AdapterError::new("Windows could read semantic target control type"))?;
+        if normalize_window_title(&control_type.to_string()).eq_ignore_ascii_case("window") {
+            return Ok(true);
+        }
+        let bounds = element
+            .CurrentBoundingRectangle()
+            .map_err(|_| AdapterError::new("Windows could read semantic target bounds"))?;
+        if bounds.right <= bounds.left || bounds.bottom <= bounds.top {
+            return Ok(false);
+        }
+        element
+            .CurrentIsEnabled()
+            .map(|enabled| enabled.as_bool())
+            .map_err(|_| AdapterError::new("Windows could read semantic target enabled state"))
+    })
+}
+
 fn semantic_target_name_contains(target: &Target, text: &str) -> Result<bool, AdapterError> {
     semantic_target_readiness(target, |element| unsafe {
         element
@@ -1348,21 +1969,16 @@ fn semantic_target_readiness(
 }
 
 fn is_target_absent(error: &AdapterError) -> bool {
-    has_failure_kind(error, "notFound")
+    has_failure_kind(error, FailureKind::NotFound)
 }
 
 fn is_transient_readiness_error(error: &AdapterError) -> bool {
-    error.diagnostics().is_none() && error.to_string().starts_with("Windows could ")
+    matches!(error.failure_kind(), Some(FailureKind::Transient))
+        || (error.diagnostics().is_none() && error.to_string().starts_with("Windows could "))
 }
 
-fn has_failure_kind(error: &AdapterError, kind: &str) -> bool {
-    let Some(diagnostics) = error.diagnostics() else {
-        return false;
-    };
-    diagnostics
-        .split(';')
-        .next()
-        .is_some_and(|field| field.trim() == format!("failureKind={kind}"))
+fn has_failure_kind(error: &AdapterError, kind: FailureKind) -> bool {
+    error.failure_kind() == Some(kind)
 }
 
 fn inspect_accessibility_node(
@@ -1454,6 +2070,7 @@ fn inspected_accessibility_node(
     let control_type = current_bstr(element, |element| unsafe {
         element.CurrentLocalizedControlType()
     });
+    let bounds = current_bounds(element);
     AccessibilityNode {
         path: path.to_vec(),
         depth: path.len() as u32,
@@ -1461,7 +2078,8 @@ fn inspected_accessibility_node(
         automation_id: automation_id.clone(),
         control_type: control_type.clone(),
         class_name: current_bstr(element, |element| unsafe { element.CurrentClassName() }),
-        bounds: current_bounds(element),
+        bounds,
+        click_point: bounds.and_then(click_point_for_bounds),
         enabled: current_bool(element, |element| unsafe { element.CurrentIsEnabled() }),
         keyboard_focusable: current_bool(element, |element| unsafe {
             element.CurrentIsKeyboardFocusable()
@@ -1635,6 +2253,16 @@ fn current_bounds(element: &IUIAutomationElement) -> Option<AccessibilityBounds>
     })
 }
 
+fn click_point_for_bounds(bounds: AccessibilityBounds) -> Option<AccessibilityPoint> {
+    if bounds.right <= bounds.left || bounds.bottom <= bounds.top {
+        return None;
+    }
+    Some(AccessibilityPoint {
+        x: bounds.left + ((bounds.right - bounds.left) / 2),
+        y: bounds.top + ((bounds.bottom - bounds.top) / 2),
+    })
+}
+
 fn current_value(element: &IUIAutomationElement, include_values: bool) -> Option<String> {
     if !include_values
         || current_bool(element, |element| unsafe { element.CurrentIsPassword() }) == Some(true)
@@ -1735,6 +2363,7 @@ fn with_semantic_target<T>(
             if truncated {
                 return Err(
                     AdapterError::new("requested semantic target search was truncated")
+                        .with_failure_kind(FailureKind::TruncatedSearch)
                         .with_source(format!(
                             "failureKind=truncatedSearch; {}",
                             semantic_search_diagnostics(target, accessibility, &[], &inspected)
@@ -1745,12 +2374,12 @@ fn with_semantic_target<T>(
         };
 
         match matching.as_slice() {
-            [] => Err(
-                AdapterError::new("requested semantic target was not found").with_source(format!(
+            [] => Err(AdapterError::new("requested semantic target was not found")
+                .with_failure_kind(FailureKind::NotFound)
+                .with_source(format!(
                     "failureKind=notFound; {}",
                     semantic_search_diagnostics(target, accessibility, &[], &inspected)
-                )),
-            ),
+                ))),
             [element] => operation(&element.element),
             _ => {
                 let matched = matching
@@ -1759,6 +2388,7 @@ fn with_semantic_target<T>(
                     .collect::<Vec<_>>();
                 Err(
                     AdapterError::new("requested semantic target matched multiple elements")
+                        .with_failure_kind(FailureKind::Ambiguous)
                         .with_source(format!(
                             "failureKind=ambiguous; {}",
                             semantic_search_diagnostics(
@@ -1810,7 +2440,9 @@ fn find_element_by_path(
 }
 
 fn semantic_target_not_found() -> AdapterError {
-    AdapterError::new("requested semantic target was not found").with_source("failureKind=notFound")
+    AdapterError::new("requested semantic target was not found")
+        .with_failure_kind(FailureKind::NotFound)
+        .with_source("failureKind=notFound")
 }
 
 fn collect_semantic_matches(
@@ -1936,7 +2568,21 @@ fn accessibility_matches(
 
 fn unsupported_action_reason(action: &Action, config: &RunConfig) -> Option<&'static str> {
     match action {
-        Action::FocusWindow { target } => unsupported_window_target_reason(target),
+        Action::LaunchUrl {
+            target: Some(target),
+            ..
+        }
+        | Action::LaunchApp {
+            target: Some(target),
+            ..
+        }
+        | Action::OpenFile {
+            target: Some(target),
+            ..
+        } => unsupported_launch_target_reason(target, config),
+        Action::FocusWindow { target } => {
+            unsupported_window_target_reason_with_config(target, config)
+        }
         Action::ClickTarget { target } if target.coordinates.is_some() => {
             unsupported_coordinate_target_reason(target, config)
         }
@@ -1959,7 +2605,9 @@ fn unsupported_action_reason(action: &Action, config: &RunConfig) -> Option<&'st
             Assertion::TargetExists { target } if target.accessibility.is_some() => {
                 unsupported_semantic_target_reason_with_config(target, config)
             }
-            Assertion::TargetExists { target } => unsupported_window_target_reason(target),
+            Assertion::TargetExists { target } => {
+                unsupported_window_target_reason_with_config(target, config)
+            }
             Assertion::Condition { condition } => unsupported_wait_reason(condition, config),
         },
         _ => None,
@@ -1983,6 +2631,7 @@ fn unsupported_wait_reason(condition: &WaitCondition, config: &RunConfig) -> Opt
         | WaitCondition::TargetFocused { target }
         | WaitCondition::TargetEnabled { target }
         | WaitCondition::TargetVisible { target }
+        | WaitCondition::TargetActionable { target }
         | WaitCondition::TargetNotExists { target }
         | WaitCondition::TargetNameContains { target, .. } => {
             unsupported_semantic_target_reason_with_config(target, config)
@@ -2004,6 +2653,9 @@ fn unsupported_semantic_target_reason_with_config(
     target: &Target,
     config: &RunConfig,
 ) -> Option<&'static str> {
+    if let Some(reason) = unsupported_image_target_reason(target, config) {
+        return Some(reason);
+    }
     if target.accessibility.is_none() {
         return Some("semantic target operations require an accessibility selector");
     }
@@ -2024,10 +2676,37 @@ fn unsupported_semantic_target_reason_with_config(
     unsupported_window_target_reason(&window_target)
 }
 
+fn unsupported_window_target_reason_with_config(
+    target: &Target,
+    config: &RunConfig,
+) -> Option<&'static str> {
+    if let Some(reason) = unsupported_image_target_reason(target, config) {
+        return Some(reason);
+    }
+    unsupported_window_target_reason(target)
+}
+
+fn unsupported_launch_target_reason(target: &Target, config: &RunConfig) -> Option<&'static str> {
+    if let Some(reason) = unsupported_image_target_reason(target, config) {
+        return Some(reason);
+    }
+    unsupported_window_target_reason(target)
+}
+
+fn reject_unsupported_target(reason: Option<&'static str>) -> Result<(), AdapterError> {
+    if let Some(reason) = reason {
+        return Err(AdapterError::unsupported(reason).with_failure_kind(FailureKind::PolicyDenied));
+    }
+    Ok(())
+}
+
 fn unsupported_coordinate_target_reason(
     target: &Target,
     config: &RunConfig,
 ) -> Option<&'static str> {
+    if let Some(reason) = unsupported_image_target_reason(target, config) {
+        return Some(reason);
+    }
     if !config.allow_coordinate_targets {
         return Some("coordinate targets require explicit allowCoordinateTargets approval");
     }
@@ -2053,6 +2732,7 @@ fn unsupported_window_target_reason(target: &Target) -> Option<&'static str> {
         || target.process_name.is_some()
         || target.url.is_some()
         || target.file_path.is_some()
+        || target.accessibility.is_some()
         || target.image.is_some()
         || target.coordinates.is_some()
         || !target.platform_selectors.is_empty()
@@ -2070,6 +2750,16 @@ fn unsupported_window_target_reason(target: &Target) -> Option<&'static str> {
     }
 
     None
+}
+
+fn unsupported_image_target_reason(target: &Target, config: &RunConfig) -> Option<&'static str> {
+    target.image.as_ref()?;
+    if !config.allow_image_targets {
+        return Some("image targets require explicit allowImageTargets approval");
+    }
+    Some(
+        "Windows image target matching is not implemented yet; use accessibility selectors for reliable automation",
+    )
 }
 
 fn unsupported_process_target_reason(target: &Target) -> Option<&'static str> {
@@ -2090,10 +2780,30 @@ fn unsupported_command_reason(command: &str, config: &RunConfig) -> Option<&'sta
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use cueflow_core::{AccessibilityTarget, PlatformSelector};
-    use cueflow_executor::ExecutionAdapter;
+    use cueflow_core::{AccessibilityTarget, FailureKind, PlatformSelector};
+    use cueflow_executor::{EvidencePhase, ExecutionAdapter};
 
     use super::*;
+
+    fn window_target_with_path_only_accessibility() -> Target {
+        Target {
+            app_name: None,
+            process_name: None,
+            window_title: Some("Cueflow Impossible Window".to_string()),
+            title_contains: None,
+            url: None,
+            file_path: None,
+            accessibility: Some(AccessibilityTarget {
+                id: None,
+                name: None,
+                control_type: None,
+                path: Some(Vec::new()),
+            }),
+            image: None,
+            coordinates: None,
+            platform_selectors: BTreeMap::new(),
+        }
+    }
 
     #[test]
     fn windows_capabilities_expose_supported_and_gated_features() {
@@ -2322,6 +3032,371 @@ mod tests {
     }
 
     #[test]
+    fn preflight_rejects_launch_targets_with_image_selectors() {
+        let adapter = WindowsDesktopAdapter;
+        let diagnostics = adapter.preflight(
+            &Action::LaunchApp {
+                app: "ms-settings:".to_string(),
+                target: Some(Target {
+                    app_name: None,
+                    process_name: None,
+                    window_title: Some("Settings".to_string()),
+                    title_contains: None,
+                    url: None,
+                    file_path: None,
+                    accessibility: None,
+                    image: Some(cueflow_core::ImageTarget {
+                        path: "fixtures/settings-search.bmp".to_string(),
+                        confidence: None,
+                        region: None,
+                    }),
+                    coordinates: None,
+                    platform_selectors: BTreeMap::new(),
+                }),
+            },
+            &RunConfig::default(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].message,
+            "image targets require explicit allowImageTargets approval"
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_open_file_targets_with_image_selectors() {
+        let adapter = WindowsDesktopAdapter;
+        let diagnostics = adapter.preflight(
+            &Action::OpenFile {
+                path: "C:\\Windows\\System32\\notepad.exe".to_string(),
+                target: Some(Target {
+                    app_name: None,
+                    process_name: None,
+                    window_title: Some("Untitled - Notepad".to_string()),
+                    title_contains: None,
+                    url: None,
+                    file_path: None,
+                    accessibility: None,
+                    image: Some(cueflow_core::ImageTarget {
+                        path: "fixtures/notepad.bmp".to_string(),
+                        confidence: None,
+                        region: None,
+                    }),
+                    coordinates: None,
+                    platform_selectors: BTreeMap::new(),
+                }),
+            },
+            &RunConfig::default(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].message,
+            "image targets require explicit allowImageTargets approval"
+        );
+    }
+
+    #[test]
+    fn direct_execute_rejects_launch_targets_with_image_selectors_before_opening() {
+        let mut adapter = WindowsDesktopAdapter;
+        let error = adapter
+            .execute(
+                &Action::LaunchUrl {
+                    url: "cueflow-test-do-not-open:".to_string(),
+                    target: Some(Target {
+                        app_name: None,
+                        process_name: None,
+                        window_title: Some("Cueflow Impossible Window".to_string()),
+                        title_contains: None,
+                        url: None,
+                        file_path: None,
+                        accessibility: None,
+                        image: Some(cueflow_core::ImageTarget {
+                            path: "fixtures/impossible.bmp".to_string(),
+                            confidence: None,
+                            region: None,
+                        }),
+                        coordinates: None,
+                        platform_selectors: BTreeMap::new(),
+                    }),
+                },
+                &RunConfig::default(),
+            )
+            .expect_err("image launch target is policy denied before shell open");
+
+        assert_eq!(error.failure_kind(), Some(FailureKind::PolicyDenied));
+        assert_eq!(
+            error.to_string(),
+            "image targets require explicit allowImageTargets approval"
+        );
+    }
+
+    #[test]
+    fn direct_execute_rejects_open_file_targets_with_image_selectors_before_opening() {
+        let mut adapter = WindowsDesktopAdapter;
+        let error = adapter
+            .execute(
+                &Action::OpenFile {
+                    path: "C:\\cueflow\\missing-file-that-must-not-open.txt".to_string(),
+                    target: Some(Target {
+                        app_name: None,
+                        process_name: None,
+                        window_title: Some("Cueflow Impossible Window".to_string()),
+                        title_contains: None,
+                        url: None,
+                        file_path: None,
+                        accessibility: None,
+                        image: Some(cueflow_core::ImageTarget {
+                            path: "fixtures/impossible.bmp".to_string(),
+                            confidence: None,
+                            region: None,
+                        }),
+                        coordinates: None,
+                        platform_selectors: BTreeMap::new(),
+                    }),
+                },
+                &RunConfig::default(),
+            )
+            .expect_err("image open-file target is policy denied before shell open");
+
+        assert_eq!(error.failure_kind(), Some(FailureKind::PolicyDenied));
+        assert_eq!(
+            error.to_string(),
+            "image targets require explicit allowImageTargets approval"
+        );
+    }
+
+    #[test]
+    fn direct_execute_rejects_accessibility_bearing_window_targets_before_side_effects() {
+        let mut adapter = WindowsDesktopAdapter;
+
+        let launch_error = adapter
+            .execute(
+                &Action::LaunchUrl {
+                    url: "cueflow-test-do-not-open:".to_string(),
+                    target: Some(window_target_with_path_only_accessibility()),
+                },
+                &RunConfig::default(),
+            )
+            .expect_err("launch window target cannot carry accessibility selectors");
+        let open_file_error = adapter
+            .execute(
+                &Action::OpenFile {
+                    path: "C:\\cueflow\\missing-file-that-must-not-open.txt".to_string(),
+                    target: Some(window_target_with_path_only_accessibility()),
+                },
+                &RunConfig::default(),
+            )
+            .expect_err("open-file window target cannot carry accessibility selectors");
+        let focus_error = adapter
+            .execute(
+                &Action::FocusWindow {
+                    target: window_target_with_path_only_accessibility(),
+                },
+                &RunConfig::default(),
+            )
+            .expect_err("focus window target cannot carry accessibility selectors");
+
+        for error in [launch_error, open_file_error, focus_error] {
+            assert_eq!(error.failure_kind(), Some(FailureKind::PolicyDenied));
+            assert_eq!(
+                error.to_string(),
+                "Windows window queries currently support only a windowTitle or titleContains selector"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_execute_rejects_path_only_semantic_targets_before_resolving() {
+        let mut adapter = WindowsDesktopAdapter;
+        let error = adapter
+            .execute(
+                &Action::TypeText {
+                    text: "should-not-type".to_string(),
+                    target: Some(Target {
+                        app_name: None,
+                        process_name: None,
+                        window_title: Some("Cueflow Impossible Window".to_string()),
+                        title_contains: None,
+                        url: None,
+                        file_path: None,
+                        accessibility: Some(AccessibilityTarget {
+                            id: None,
+                            name: None,
+                            control_type: None,
+                            path: Some(Vec::new()),
+                        }),
+                        image: None,
+                        coordinates: None,
+                        platform_selectors: BTreeMap::new(),
+                    }),
+                },
+                &RunConfig::default(),
+            )
+            .expect_err("path-only semantic target is policy denied before UIA lookup");
+
+        assert_eq!(error.failure_kind(), Some(FailureKind::PolicyDenied));
+        assert_eq!(
+            error.to_string(),
+            "path-only accessibility selectors require explicit allowPathOnlySelectors approval"
+        );
+    }
+
+    #[test]
+    fn trait_invoke_rejects_image_targets_before_uia_lookup() {
+        let mut adapter = WindowsDesktopAdapter;
+        let error = adapter
+            .invoke_target(
+                &Target {
+                    app_name: None,
+                    process_name: None,
+                    window_title: Some("Cueflow Impossible Window".to_string()),
+                    title_contains: None,
+                    url: None,
+                    file_path: None,
+                    accessibility: Some(AccessibilityTarget {
+                        id: Some("submit".to_string()),
+                        name: None,
+                        control_type: None,
+                        path: None,
+                    }),
+                    image: Some(cueflow_core::ImageTarget {
+                        path: "fixtures/impossible.bmp".to_string(),
+                        confidence: None,
+                        region: None,
+                    }),
+                    coordinates: None,
+                    platform_selectors: BTreeMap::new(),
+                },
+                &RunConfig::default(),
+            )
+            .expect_err("image target is policy denied before UIA lookup");
+
+        assert_eq!(error.failure_kind(), Some(FailureKind::PolicyDenied));
+        assert_eq!(
+            error.to_string(),
+            "image targets require explicit allowImageTargets approval"
+        );
+    }
+
+    #[test]
+    fn trait_text_and_scroll_reject_path_only_targets_before_uia_lookup() {
+        let mut adapter = WindowsDesktopAdapter;
+        let target = Target {
+            app_name: None,
+            process_name: None,
+            window_title: Some("Cueflow Impossible Window".to_string()),
+            title_contains: None,
+            url: None,
+            file_path: None,
+            accessibility: Some(AccessibilityTarget {
+                id: None,
+                name: None,
+                control_type: None,
+                path: Some(Vec::new()),
+            }),
+            image: None,
+            coordinates: None,
+            platform_selectors: BTreeMap::new(),
+        };
+
+        let text_error = adapter
+            .set_target_text(&target, "should-not-type", &RunConfig::default())
+            .expect_err("path-only text target is policy denied before UIA lookup");
+        let scroll_error = adapter
+            .scroll_target(&target, 0, 1, &RunConfig::default())
+            .expect_err("path-only scroll target is policy denied before UIA lookup");
+
+        assert_eq!(text_error.failure_kind(), Some(FailureKind::PolicyDenied));
+        assert_eq!(scroll_error.failure_kind(), Some(FailureKind::PolicyDenied));
+        assert_eq!(
+            text_error.to_string(),
+            "path-only accessibility selectors require explicit allowPathOnlySelectors approval"
+        );
+        assert_eq!(
+            scroll_error.to_string(),
+            "path-only accessibility selectors require explicit allowPathOnlySelectors approval"
+        );
+    }
+
+    #[test]
+    fn capture_step_evidence_rejects_policy_denied_targets_before_writing_files() {
+        let mut adapter = WindowsDesktopAdapter;
+        let config = RunConfig {
+            capture_step_evidence: true,
+            evidence_directory: Some("C:\\cueflow\\must-not-be-created".to_string()),
+            ..RunConfig::default()
+        };
+        let error = adapter
+            .capture_step_evidence(
+                EvidencePhase::Before,
+                &Action::ClickTarget {
+                    target: Target {
+                        app_name: None,
+                        process_name: None,
+                        window_title: Some("Cueflow Impossible Window".to_string()),
+                        title_contains: None,
+                        url: None,
+                        file_path: None,
+                        accessibility: Some(AccessibilityTarget {
+                            id: Some("submit".to_string()),
+                            name: None,
+                            control_type: None,
+                            path: None,
+                        }),
+                        image: Some(cueflow_core::ImageTarget {
+                            path: "fixtures/impossible.bmp".to_string(),
+                            confidence: None,
+                            region: None,
+                        }),
+                        coordinates: None,
+                        platform_selectors: BTreeMap::new(),
+                    },
+                },
+                &config,
+                "run-test",
+                "automation-test",
+                "step-test",
+            )
+            .expect_err("policy-denied evidence target is rejected before file writes");
+
+        assert_eq!(error.failure_kind(), Some(FailureKind::PolicyDenied));
+        assert_eq!(
+            error.to_string(),
+            "image targets require explicit allowImageTargets approval"
+        );
+    }
+
+    #[test]
+    fn capture_step_evidence_rejects_accessibility_bearing_window_targets_before_writing_files() {
+        let mut adapter = WindowsDesktopAdapter;
+        let config = RunConfig {
+            capture_step_evidence: true,
+            evidence_directory: Some("C:\\cueflow\\must-not-be-created".to_string()),
+            ..RunConfig::default()
+        };
+        let error = adapter
+            .capture_step_evidence(
+                EvidencePhase::Before,
+                &Action::FocusWindow {
+                    target: window_target_with_path_only_accessibility(),
+                },
+                &config,
+                "run-test",
+                "automation-test",
+                "step-test",
+            )
+            .expect_err("accessibility-bearing window target is rejected before file writes");
+
+        assert_eq!(error.failure_kind(), Some(FailureKind::PolicyDenied));
+        assert_eq!(
+            error.to_string(),
+            "Windows window queries currently support only a windowTitle or titleContains selector"
+        );
+    }
+
+    #[test]
     fn preflight_rejects_targeted_key_chords_without_accessibility_scope() {
         let adapter = WindowsDesktopAdapter;
         let diagnostics = adapter.preflight(
@@ -2493,6 +3568,11 @@ mod tests {
         assert_eq!(i32::from_le_bytes(bytes[22..26].try_into().unwrap()), -1);
         assert_eq!(u16::from_le_bytes(bytes[28..30].try_into().unwrap()), 32);
         assert_eq!(&bytes[54..], &pixels);
+    }
+
+    #[test]
+    fn bmp_file_size_matches_32bpp_header_and_pixels() {
+        assert_eq!(bmp_file_size(2, 1).expect("size"), 62);
     }
 
     #[test]

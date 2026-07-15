@@ -20,6 +20,8 @@ pub struct AdapterCapabilities {
 pub struct AccessibilityTree {
     pub platform: Platform,
     pub window_title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<WindowIdentity>,
     pub selector: String,
     pub max_depth: u32,
     pub max_nodes: usize,
@@ -37,6 +39,7 @@ pub struct AccessibilityNode {
     pub control_type: String,
     pub class_name: String,
     pub bounds: Option<AccessibilityBounds>,
+    pub click_point: Option<AccessibilityPoint>,
     pub enabled: Option<bool>,
     pub keyboard_focusable: Option<bool>,
     pub has_keyboard_focus: Option<bool>,
@@ -56,6 +59,15 @@ pub struct AccessibilitySelectorCandidate {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectorRepairReport {
+    pub original: Target,
+    pub matched: bool,
+    pub candidates: Vec<AccessibilitySelectorCandidate>,
+    pub diagnostics: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SelectorConfidence {
@@ -72,6 +84,27 @@ pub struct AccessibilityBounds {
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessibilityPoint {
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowIdentity {
+    pub handle: String,
+    pub title: String,
+    pub class_name: String,
+    pub process_id: u32,
+    pub process_name: Option<String>,
+    pub bounds: Option<AccessibilityBounds>,
+    pub is_foreground: bool,
+    pub is_minimized: bool,
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -153,6 +186,27 @@ impl CurrentPlatformAdapter {
     ) -> Result<Artifact, AdapterError> {
         Err(AdapterError::unsupported(
             "screenshot capture is not implemented on this platform",
+        ))
+    }
+
+    pub fn capture_window_screenshot(
+        &self,
+        _target: &cueflow_core::Target,
+        _path: impl AsRef<std::path::Path>,
+    ) -> Result<Artifact, AdapterError> {
+        Err(AdapterError::unsupported(
+            "window screenshot capture is not implemented on this platform",
+        ))
+    }
+
+    pub fn repair_selector(
+        &self,
+        _target: &cueflow_core::Target,
+        _max_depth: u32,
+        _max_nodes: usize,
+    ) -> Result<SelectorRepairReport, AdapterError> {
+        Err(AdapterError::unsupported(
+            "selector repair is not implemented on this platform",
         ))
     }
 }

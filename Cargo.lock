@@ -9,6 +9,7 @@ dependencies = [
  "cueflow-core",
  "cueflow-executor",
  "serde",
+ "serde_json",
  "windows",
 ]
 
@@ -19,6 +20,7 @@ dependencies = [
  "cueflow-adapters",
  "cueflow-core",
  "cueflow-executor",
+ "serde",
  "serde_json",
 ]
 

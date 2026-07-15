@@ -1,0 +1,42 @@
+{
+  "id": "windows-actionability-readiness-drill",
+  "title": "Windows actionability readiness drill",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "open-settings",
+      "kind": "launchApp",
+      "app": "ms-settings:",
+      "timeout": {
+        "millis": 5000
+      }
+    },
+    {
+      "id": "wait-settings-settled",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "duration",
+        "duration": {
+          "millis": 1000
+        }
+      }
+    },
+    {
+      "id": "wait-root-actionable",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "targetActionable",
+        "target": {
+          "windowTitle": "Settings",
+          "accessibility": {
+            "path": [],
+            "controlType": "window"
+          }
+        }
+      },
+      "timeout": {
+        "millis": 5000
+      }
+    }
+  ]
+}

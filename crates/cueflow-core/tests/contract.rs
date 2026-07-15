@@ -13,6 +13,13 @@ const EDGE_PAGE_DRILL: &str = include_str!("../../../examples/edge-page-drill.js
 const EDGE_SEARCH_CUEFLOW: &str = include_str!("../../../examples/edge-search-cueflow.json");
 const WINDOWS_SETTINGS_READINESS_DRILL: &str =
     include_str!("../../../examples/windows-settings-readiness-drill.json");
+const WINDOWS_ACTIONABILITY_READINESS_DRILL: &str =
+    include_str!("../../../examples/windows-actionability-readiness-drill.json");
+const WINDOWS_MISSING_WINDOW_TIMEOUT_DRILL: &str =
+    include_str!("../../../examples/windows-missing-window-timeout-drill.json");
+const WINDOWS_IMAGE_TARGET_POLICY_DRILL: &str =
+    include_str!("../../../examples/windows-image-target-policy-drill.json");
+const WINDOWS_DRILL_MANIFEST: &str = include_str!("../../../examples/windows-drill-manifest.json");
 
 #[test]
 fn v1_fixture_is_a_stable_json_round_trip() {
@@ -42,6 +49,14 @@ fn generated_schema_describes_the_public_definition() {
     );
     assert_eq!(
         schema["$defs"]["ImageTarget"]["properties"]["confidence"]["minimum"],
+        1
+    );
+    assert_eq!(
+        schema["$defs"]["ImageRegion"]["properties"]["width"]["minimum"],
+        1
+    );
+    assert_eq!(
+        schema["$defs"]["ImageRegion"]["properties"]["height"]["minimum"],
         1
     );
 }
@@ -92,6 +107,28 @@ fn blank_selectors_are_rejected_even_when_another_selector_is_present() {
 }
 
 #[test]
+fn image_target_regions_validate_non_zero_dimensions() {
+    let mut document: Value = serde_json::from_str(AUTOMATION_V1).expect("fixture is JSON");
+    document["steps"][1]["target"] = serde_json::json!({
+        "image": {
+            "path": "fixtures/search-button.bmp",
+            "region": {
+                "left": 0,
+                "top": 0,
+                "width": 0,
+                "height": 100
+            }
+        }
+    });
+
+    let error = parse_definition_json(&document.to_string()).expect_err("empty region fails");
+    assert!(matches!(
+        error,
+        DefinitionParseError::Validation(ValidationError::InvalidImageRegion)
+    ));
+}
+
+#[test]
 fn edge_demo_fixture_remains_a_valid_portable_definition() {
     let definition = parse_definition_json(EDGE_DEMO_READY).expect("edge fixture parses");
 
@@ -131,6 +168,45 @@ fn windows_settings_readiness_drill_remains_a_valid_definition() {
         parse_definition_json(WINDOWS_SETTINGS_READINESS_DRILL).expect("settings drill parses");
 
     assert_eq!(definition.id, "windows-settings-readiness-drill");
+}
+
+#[test]
+fn windows_actionability_readiness_drill_remains_a_valid_definition() {
+    let definition = parse_definition_json(WINDOWS_ACTIONABILITY_READINESS_DRILL)
+        .expect("actionability drill parses");
+
+    assert_eq!(definition.id, "windows-actionability-readiness-drill");
+}
+
+#[test]
+fn windows_missing_window_timeout_drill_remains_a_valid_definition() {
+    let definition = parse_definition_json(WINDOWS_MISSING_WINDOW_TIMEOUT_DRILL)
+        .expect("missing window drill parses");
+
+    assert_eq!(definition.id, "windows-missing-window-timeout-drill");
+}
+
+#[test]
+fn windows_image_target_policy_drill_remains_a_valid_definition() {
+    let definition =
+        parse_definition_json(WINDOWS_IMAGE_TARGET_POLICY_DRILL).expect("image drill parses");
+
+    assert_eq!(definition.id, "windows-image-target-policy-drill");
+}
+
+#[test]
+fn windows_drill_manifest_remains_well_formed() {
+    let manifest: Value =
+        serde_json::from_str(WINDOWS_DRILL_MANIFEST).expect("drill manifest is JSON");
+
+    assert_eq!(manifest["id"], "windows-foundation-drills");
+    assert!(
+        manifest["drills"]
+            .as_array()
+            .expect("drills is an array")
+            .len()
+            >= 2
+    );
 }
 
 #[test]

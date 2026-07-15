@@ -1,0 +1,29 @@
+{
+  "id": "windows-image-target-policy-drill",
+  "title": "Windows image target policy drill",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "wait-image-target",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "targetExists",
+        "target": {
+          "windowTitle": "Settings",
+          "image": {
+            "path": "fixtures/settings-search.bmp",
+            "region": {
+              "left": 0,
+              "top": 0,
+              "width": 400,
+              "height": 300
+            }
+          }
+        }
+      },
+      "timeout": {
+        "millis": 250
+      }
+    }
+  ]
+}

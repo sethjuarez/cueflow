@@ -167,6 +167,8 @@ pub fn automation_definition_schema() -> Value {
         Value::from("^[A-Za-z0-9][A-Za-z0-9._-]*$");
     definitions["DurationSpec"]["properties"]["millis"]["minimum"] = Value::from(1);
     definitions["ImageTarget"]["properties"]["confidence"]["minimum"] = Value::from(1);
+    definitions["ImageRegion"]["properties"]["width"]["minimum"] = Value::from(1);
+    definitions["ImageRegion"]["properties"]["height"]["minimum"] = Value::from(1);
 
     schema
 }
@@ -1044,6 +1046,8 @@ pub struct ImageTarget {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<ImageRegion>,
 }
 
 impl ImageTarget {
@@ -1052,7 +1056,28 @@ impl ImageTarget {
         if self.confidence.is_some_and(|confidence| confidence == 0) {
             return Err(ValidationError::InvalidImageConfidence);
         }
+        if let Some(region) = &self.region {
+            region.validate()?;
+        }
 
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImageRegion {
+    pub left: i32,
+    pub top: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ImageRegion {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.width == 0 || self.height == 0 {
+            return Err(ValidationError::InvalidImageRegion);
+        }
         Ok(())
     }
 }
@@ -1237,6 +1262,9 @@ pub enum WaitCondition {
     TargetVisible {
         target: Target,
     },
+    TargetActionable {
+        target: Target,
+    },
     TargetNotExists {
         target: Target,
     },
@@ -1269,6 +1297,7 @@ impl WaitCondition {
             | WaitCondition::TargetFocused { target }
             | WaitCondition::TargetEnabled { target }
             | WaitCondition::TargetVisible { target }
+            | WaitCondition::TargetActionable { target }
             | WaitCondition::TargetNotExists { target } => target.validate(),
             WaitCondition::TargetNameContains { target, text } => {
                 target.validate()?;
@@ -1309,6 +1338,9 @@ impl WaitCondition {
             Self::TargetVisible { target } => Self::TargetVisible {
                 target: target.for_platform(platform),
             },
+            Self::TargetActionable { target } => Self::TargetActionable {
+                target: target.for_platform(platform),
+            },
             Self::TargetNotExists { target } => Self::TargetNotExists {
                 target: target.for_platform(platform),
             },
@@ -1337,6 +1369,7 @@ impl WaitCondition {
             | WaitCondition::TargetFocused { target }
             | WaitCondition::TargetEnabled { target }
             | WaitCondition::TargetVisible { target }
+            | WaitCondition::TargetActionable { target }
             | WaitCondition::TargetNotExists { target }
             | WaitCondition::TargetNameContains { target, .. }
             | WaitCondition::TargetValueContains { target, .. } => {
@@ -1406,6 +1439,16 @@ pub struct RunConfig {
     pub allow_path_only_selectors: bool,
     #[serde(default)]
     pub allow_value_capture: bool,
+    #[serde(default)]
+    pub capture_step_evidence: bool,
+    #[serde(default)]
+    pub allow_screenshot_capture: bool,
+    #[serde(default)]
+    pub allow_image_targets: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_max_artifact_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_directory: Option<String>,
 }
 
 impl Default for RunConfig {
@@ -1421,6 +1464,11 @@ impl Default for RunConfig {
             allow_coordinate_targets: false,
             allow_path_only_selectors: false,
             allow_value_capture: false,
+            capture_step_evidence: false,
+            allow_screenshot_capture: false,
+            allow_image_targets: false,
+            evidence_max_artifact_bytes: None,
+            evidence_directory: None,
         }
     }
 }
@@ -1513,6 +1561,8 @@ pub struct RunError {
     pub kind: RunErrorKind,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<FailureKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -1540,6 +1590,7 @@ impl RunError {
         Self {
             kind,
             message: message.into(),
+            failure_kind: None,
             step_id: None,
             source: None,
         }
@@ -1554,6 +1605,11 @@ impl RunError {
         self.source = Some(source.into());
         self
     }
+
+    pub fn with_failure_kind(mut self, failure_kind: FailureKind) -> Self {
+        self.failure_kind = Some(failure_kind);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1565,6 +1621,22 @@ pub enum RunErrorKind {
     Assertion,
     Cancelled,
     Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FailureKind {
+    NotFound,
+    Ambiguous,
+    TruncatedSearch,
+    Disabled,
+    Offscreen,
+    FocusDenied,
+    PolicyDenied,
+    UnsupportedAction,
+    Timeout,
+    Cancelled,
+    Transient,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1610,6 +1682,8 @@ pub enum ValidationError {
     EmptyPlatformSelector,
     #[error("image target confidence must be between 1 and 255")]
     InvalidImageConfidence,
+    #[error("image target region must have non-zero width and height")]
+    InvalidImageRegion,
     #[error("{0} must be greater than zero")]
     InvalidDuration(&'static str),
     #[error("retry max_attempts must be greater than zero")]

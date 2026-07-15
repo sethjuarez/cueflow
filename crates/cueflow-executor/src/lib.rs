@@ -5,9 +5,9 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cueflow_core::{
-    Action, Artifact, Assertion, AutomationDefinition, BackoffPolicy, OnErrorPolicy, Platform,
-    PreflightDiagnostic, PreflightSeverity, RunConfig, RunError, RunErrorKind, RunEvent, RunStatus,
-    Step, Target, WaitCondition,
+    Action, Artifact, Assertion, AutomationDefinition, BackoffPolicy, FailureKind, OnErrorPolicy,
+    Platform, PreflightDiagnostic, PreflightSeverity, RunConfig, RunError, RunErrorKind, RunEvent,
+    RunStatus, Step, Target, WaitCondition,
 };
 use thiserror::Error;
 use tracing::{error, info, instrument, warn};
@@ -39,6 +39,7 @@ pub enum ExecutorError {
 pub struct AdapterError {
     public_message: String,
     kind: RunErrorKind,
+    failure_kind: Option<FailureKind>,
     diagnostics: Option<String>,
 }
 
@@ -47,6 +48,7 @@ impl AdapterError {
         Self {
             public_message: message.into(),
             kind: RunErrorKind::Adapter,
+            failure_kind: None,
             diagnostics: None,
         }
     }
@@ -55,6 +57,7 @@ impl AdapterError {
         Self {
             public_message: message.into(),
             kind: RunErrorKind::Unsupported,
+            failure_kind: Some(FailureKind::UnsupportedAction),
             diagnostics: None,
         }
     }
@@ -63,6 +66,7 @@ impl AdapterError {
         Self {
             public_message: "step timed out".to_string(),
             kind: RunErrorKind::Timeout,
+            failure_kind: Some(FailureKind::Timeout),
             diagnostics: None,
         }
     }
@@ -71,6 +75,7 @@ impl AdapterError {
         Self {
             public_message: "run cancelled".to_string(),
             kind: RunErrorKind::Cancelled,
+            failure_kind: Some(FailureKind::Cancelled),
             diagnostics: None,
         }
     }
@@ -79,6 +84,7 @@ impl AdapterError {
         Self {
             public_message: message.into(),
             kind: RunErrorKind::Assertion,
+            failure_kind: None,
             diagnostics: None,
         }
     }
@@ -88,12 +94,24 @@ impl AdapterError {
         self
     }
 
+    pub fn with_failure_kind(mut self, failure_kind: FailureKind) -> Self {
+        self.failure_kind = Some(failure_kind);
+        self
+    }
+
+    pub fn failure_kind(&self) -> Option<FailureKind> {
+        self.failure_kind
+    }
+
     pub fn diagnostics(&self) -> Option<&str> {
         self.diagnostics.as_deref()
     }
 
     fn into_run_error(self, step_id: String) -> RunError {
-        let error = RunError::new(self.kind, self.public_message).with_step_id(step_id);
+        let mut error = RunError::new(self.kind, self.public_message).with_step_id(step_id);
+        if let Some(failure_kind) = self.failure_kind {
+            error = error.with_failure_kind(failure_kind);
+        }
         match self.diagnostics {
             Some(diagnostics) => error.with_source(diagnostics),
             None => error,
@@ -207,6 +225,35 @@ pub trait ExecutionAdapter {
 
     fn preflight(&self, _action: &Action, _config: &RunConfig) -> Vec<PreflightDiagnostic> {
         Vec::new()
+    }
+
+    fn capture_step_evidence(
+        &mut self,
+        _phase: EvidencePhase,
+        _action: &Action,
+        _config: &RunConfig,
+        _run_id: &str,
+        _automation_id: &str,
+        _step_id: &str,
+    ) -> Result<Vec<Artifact>, AdapterError> {
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidencePhase {
+    Before,
+    After,
+    Failure,
+}
+
+impl EvidencePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Before => "before",
+            Self::After => "after",
+            Self::Failure => "failure",
+        }
     }
 }
 
@@ -536,6 +583,17 @@ impl AutomationExecutor {
                 step_kind: action.kind().to_string(),
             },
         );
+        emit_step_evidence(
+            adapter,
+            EvidencePhase::Before,
+            &action,
+            config,
+            definition,
+            run_id,
+            &step.id,
+            events,
+            sink,
+        );
 
         let max_attempts = step.retry.max_attempts;
         let mut last_error = None;
@@ -582,6 +640,17 @@ impl AutomationExecutor {
 
             match result {
                 Ok(artifacts) => {
+                    emit_step_evidence(
+                        adapter,
+                        EvidencePhase::After,
+                        &action,
+                        config,
+                        definition,
+                        run_id,
+                        &step.id,
+                        events,
+                        sink,
+                    );
                     emit(
                         events,
                         sink,
@@ -618,6 +687,17 @@ impl AutomationExecutor {
         let error = last_error
             .unwrap_or_else(|| AdapterError::new("step failed"))
             .into_run_error(step.id.clone());
+        emit_step_evidence(
+            adapter,
+            EvidencePhase::Failure,
+            &action,
+            config,
+            definition,
+            run_id,
+            &step.id,
+            events,
+            sink,
+        );
         error!(
             automation_id = %definition.id,
             run_id = %run_id,
@@ -637,6 +717,55 @@ impl AutomationExecutor {
             },
         );
         StepOutcome::Failed(error)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_step_evidence<A: ExecutionAdapter, S: RunEventSink>(
+    adapter: &mut A,
+    phase: EvidencePhase,
+    action: &Action,
+    config: &RunConfig,
+    definition: &AutomationDefinition,
+    run_id: &str,
+    step_id: &str,
+    events: &mut Vec<RunEvent>,
+    sink: &mut S,
+) {
+    if !config.capture_step_evidence {
+        return;
+    }
+    match adapter.capture_step_evidence(phase, action, config, run_id, &definition.id, step_id) {
+        Ok(artifacts) => {
+            for artifact in artifacts {
+                emit(
+                    events,
+                    sink,
+                    RunEvent::Artifact {
+                        run_id: run_id.to_string(),
+                        automation_id: definition.id.clone(),
+                        step_id: Some(step_id.to_string()),
+                        artifact,
+                    },
+                );
+            }
+        }
+        Err(error) => {
+            emit(
+                events,
+                sink,
+                RunEvent::Log {
+                    run_id: run_id.to_string(),
+                    automation_id: definition.id.clone(),
+                    step_id: Some(step_id.to_string()),
+                    level: cueflow_core::LogLevel::Warn,
+                    message: format!(
+                        "step evidence capture failed during {}: {error}",
+                        phase.as_str()
+                    ),
+                },
+            );
+        }
     }
 }
 
@@ -749,11 +878,7 @@ fn wait_for_condition<A: ExecutionAdapter, C: ExecutionClock>(
     let timeout = timeout.unwrap_or(Duration::from_secs(30));
     loop {
         if control.is_cancelled() {
-            return Err(AdapterError {
-                public_message: "run cancelled".to_string(),
-                kind: RunErrorKind::Cancelled,
-                diagnostics: None,
-            });
+            return Err(AdapterError::cancelled());
         }
 
         let state = match condition {
@@ -789,11 +914,7 @@ fn wait_for_condition<A: ExecutionAdapter, C: ExecutionClock>(
         }
         let remaining = timeout.saturating_sub(elapsed);
         if !sleep_with_control(clock, control, remaining.min(Duration::from_millis(100))) {
-            return Err(AdapterError {
-                public_message: "run cancelled".to_string(),
-                kind: RunErrorKind::Cancelled,
-                diagnostics: None,
-            });
+            return Err(AdapterError::cancelled());
         }
     }
 }
@@ -1055,6 +1176,7 @@ mod tests {
             _config: &RunConfig,
         ) -> Result<Vec<Artifact>, AdapterError> {
             Err(AdapterError::new("simulated adapter failure")
+                .with_failure_kind(FailureKind::NotFound)
                 .with_source("selector: titleContains=\"Missing\"; candidates: none"))
         }
     }
@@ -1610,6 +1732,7 @@ mod tests {
             error.source.as_deref(),
             Some("selector: titleContains=\"Missing\"; candidates: none")
         );
+        assert_eq!(error.failure_kind, Some(FailureKind::NotFound));
     }
 
     #[test]

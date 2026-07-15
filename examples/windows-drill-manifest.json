@@ -1,0 +1,24 @@
+{
+  "id": "windows-foundation-drills",
+  "evidenceDir": "../target/cueflow-drill-evidence",
+  "drills": [
+    {
+      "id": "settings-actionability",
+      "path": "windows-actionability-readiness-drill.json",
+      "expectedOutcome": "succeeded",
+      "allowPathOnlySelectors": true,
+      "captureStepEvidence": true,
+      "pruneEvidenceBeforeRun": true
+    },
+    {
+      "id": "missing-window-timeout",
+      "path": "windows-missing-window-timeout-drill.json",
+      "expectedOutcome": "failed"
+    },
+    {
+      "id": "image-target-policy",
+      "path": "windows-image-target-policy-drill.json",
+      "expectedOutcome": "executorError"
+    }
+  ]
+}
