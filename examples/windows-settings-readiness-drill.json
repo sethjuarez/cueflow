@@ -1,0 +1,73 @@
+{
+  "id": "windows-settings-readiness-drill",
+  "title": "Windows Settings readiness drill",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "open-settings",
+      "kind": "launchApp",
+      "app": "ms-settings:",
+      "timeout": {
+        "millis": 5000
+      }
+    },
+    {
+      "id": "wait-settings-settled",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "duration",
+        "duration": {
+          "millis": 1000
+        }
+      }
+    },
+    {
+      "id": "wait-settings-window",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "windowExists",
+        "target": {
+          "windowTitle": "Settings"
+        }
+      },
+      "timeout": {
+        "millis": 5000
+      }
+    },
+    {
+      "id": "wait-root-visible",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "targetVisible",
+        "target": {
+          "windowTitle": "Settings",
+          "accessibility": {
+            "path": [],
+            "controlType": "window"
+          }
+        }
+      },
+      "timeout": {
+        "millis": 5000
+      }
+    },
+    {
+      "id": "assert-root-name",
+      "kind": "assert",
+      "assertion": {
+        "kind": "condition",
+        "condition": {
+          "kind": "targetNameContains",
+          "target": {
+            "windowTitle": "Settings",
+            "accessibility": {
+              "path": [],
+              "controlType": "window"
+            }
+          },
+          "text": "Settings"
+        }
+      }
+    }
+  ]
+}

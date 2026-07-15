@@ -88,8 +88,16 @@ impl AdapterError {
         self
     }
 
+    pub fn diagnostics(&self) -> Option<&str> {
+        self.diagnostics.as_deref()
+    }
+
     fn into_run_error(self, step_id: String) -> RunError {
-        RunError::new(self.kind, self.public_message).with_step_id(step_id)
+        let error = RunError::new(self.kind, self.public_message).with_step_id(step_id);
+        match self.diagnostics {
+            Some(diagnostics) => error.with_source(diagnostics),
+            None => error,
+        }
     }
 }
 
@@ -1038,6 +1046,19 @@ mod tests {
         preflight_diagnostics: Vec<PreflightDiagnostic>,
     }
 
+    struct DiagnosticFailingAdapter;
+
+    impl ExecutionAdapter for DiagnosticFailingAdapter {
+        fn execute(
+            &mut self,
+            _action: &Action,
+            _config: &RunConfig,
+        ) -> Result<Vec<Artifact>, AdapterError> {
+            Err(AdapterError::new("simulated adapter failure")
+                .with_source("selector: titleContains=\"Missing\"; candidates: none"))
+        }
+    }
+
     #[derive(Default)]
     struct SemanticRecordingAdapter {
         invoked_targets: usize,
@@ -1340,6 +1361,7 @@ mod tests {
                                 id: Some("submit".to_string()),
                                 name: None,
                                 control_type: None,
+                                path: None,
                             }),
                             image: None,
                             coordinates: None,
@@ -1376,6 +1398,7 @@ mod tests {
                             id: Some("submit".to_string()),
                             name: None,
                             control_type: None,
+                            path: None,
                         }),
                         image: None,
                         coordinates: None,
@@ -1562,6 +1585,31 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn adapter_failure_diagnostics_are_preserved_in_run_errors() {
+        let executor = AutomationExecutor::new();
+        let mut adapter = DiagnosticFailingAdapter;
+
+        let report = executor
+            .run(
+                &definition(),
+                RunConfig {
+                    dry_run: false,
+                    ..RunConfig::default()
+                },
+                &mut adapter,
+            )
+            .expect("failed adapter returns a run report");
+
+        let RunEvent::StepFailed { error, .. } = &report.events[2] else {
+            panic!("failed step event is emitted");
+        };
+        assert_eq!(
+            error.source.as_deref(),
+            Some("selector: titleContains=\"Missing\"; candidates: none")
+        );
     }
 
     #[test]

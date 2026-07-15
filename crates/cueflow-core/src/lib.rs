@@ -984,6 +984,7 @@ impl Target {
                     id: None,
                     name: Some(name.clone()),
                     control_type: None,
+                    path: None,
                 }),
             image: None,
             coordinates: None,
@@ -1009,6 +1010,8 @@ pub struct AccessibilityTarget {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<Vec<u32>>,
 }
 
 impl AccessibilityTarget {
@@ -1026,6 +1029,7 @@ impl AccessibilityTarget {
                 .control_type
                 .as_ref()
                 .is_none_or(|value| value.trim().is_empty())
+            && self.path.is_none()
         {
             return Err(ValidationError::EmptyAccessibilityTarget);
         }
@@ -1221,6 +1225,29 @@ pub enum WaitCondition {
     ProcessRunning {
         target: Target,
     },
+    TargetExists {
+        target: Target,
+    },
+    TargetFocused {
+        target: Target,
+    },
+    TargetEnabled {
+        target: Target,
+    },
+    TargetVisible {
+        target: Target,
+    },
+    TargetNotExists {
+        target: Target,
+    },
+    TargetNameContains {
+        target: Target,
+        text: String,
+    },
+    TargetValueContains {
+        target: Target,
+        text: String,
+    },
     FileExists {
         path: String,
     },
@@ -1237,7 +1264,20 @@ impl WaitCondition {
             WaitCondition::Duration { duration } => duration.validate("wait duration"),
             WaitCondition::WindowExists { target }
             | WaitCondition::WindowFocused { target }
-            | WaitCondition::ProcessRunning { target } => target.validate(),
+            | WaitCondition::ProcessRunning { target }
+            | WaitCondition::TargetExists { target }
+            | WaitCondition::TargetFocused { target }
+            | WaitCondition::TargetEnabled { target }
+            | WaitCondition::TargetVisible { target }
+            | WaitCondition::TargetNotExists { target } => target.validate(),
+            WaitCondition::TargetNameContains { target, text } => {
+                target.validate()?;
+                validate_non_empty("target name text", text)
+            }
+            WaitCondition::TargetValueContains { target, text } => {
+                target.validate()?;
+                validate_non_empty("target value text", text)
+            }
             WaitCondition::FileExists { path } => validate_non_empty("path", path),
             WaitCondition::CommandExits { command, .. } => validate_non_empty("command", command),
         }
@@ -1257,6 +1297,29 @@ impl WaitCondition {
             Self::ProcessRunning { target } => Self::ProcessRunning {
                 target: target.for_platform(platform),
             },
+            Self::TargetExists { target } => Self::TargetExists {
+                target: target.for_platform(platform),
+            },
+            Self::TargetFocused { target } => Self::TargetFocused {
+                target: target.for_platform(platform),
+            },
+            Self::TargetEnabled { target } => Self::TargetEnabled {
+                target: target.for_platform(platform),
+            },
+            Self::TargetVisible { target } => Self::TargetVisible {
+                target: target.for_platform(platform),
+            },
+            Self::TargetNotExists { target } => Self::TargetNotExists {
+                target: target.for_platform(platform),
+            },
+            Self::TargetNameContains { target, text } => Self::TargetNameContains {
+                target: target.for_platform(platform),
+                text: text.clone(),
+            },
+            Self::TargetValueContains { target, text } => Self::TargetValueContains {
+                target: target.for_platform(platform),
+                text: text.clone(),
+            },
             Self::FileExists { path } => Self::FileExists { path: path.clone() },
             Self::CommandExits { command, args } => Self::CommandExits {
                 command: command.clone(),
@@ -1269,7 +1332,16 @@ impl WaitCondition {
         match self {
             WaitCondition::WindowExists { target }
             | WaitCondition::WindowFocused { target }
-            | WaitCondition::ProcessRunning { target } => target.collect_platforms(platforms),
+            | WaitCondition::ProcessRunning { target }
+            | WaitCondition::TargetExists { target }
+            | WaitCondition::TargetFocused { target }
+            | WaitCondition::TargetEnabled { target }
+            | WaitCondition::TargetVisible { target }
+            | WaitCondition::TargetNotExists { target }
+            | WaitCondition::TargetNameContains { target, .. }
+            | WaitCondition::TargetValueContains { target, .. } => {
+                target.collect_platforms(platforms)
+            }
             WaitCondition::Duration { .. }
             | WaitCondition::FileExists { .. }
             | WaitCondition::CommandExits { .. } => {}
@@ -1328,6 +1400,12 @@ pub struct RunConfig {
     pub approved_commands: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<Platform>,
+    #[serde(default)]
+    pub allow_coordinate_targets: bool,
+    #[serde(default)]
+    pub allow_path_only_selectors: bool,
+    #[serde(default)]
+    pub allow_value_capture: bool,
 }
 
 impl Default for RunConfig {
@@ -1340,6 +1418,9 @@ impl Default for RunConfig {
             environment: BTreeMap::new(),
             approved_commands: BTreeSet::new(),
             platform: None,
+            allow_coordinate_targets: false,
+            allow_path_only_selectors: false,
+            allow_value_capture: false,
         }
     }
 }
@@ -1499,6 +1580,7 @@ pub struct Artifact {
 #[serde(rename_all = "camelCase")]
 pub enum ArtifactKind {
     Screenshot,
+    AccessibilityTree,
     Log,
     Video,
     File,

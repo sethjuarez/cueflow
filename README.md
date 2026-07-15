@@ -76,11 +76,15 @@ Definitions declare typed variables with optional literal defaults or a named `s
 
 Runs emit structured `RunEvent` values that apps can map into traces, logs, timelines, or artifacts. The executor also uses `tracing` fields for `automation_id`, `run_id`, `step_id`, `step_kind`, `target`, and `error`. Cueflow stays standalone and does not require Auditaur or any other tracing backend.
 
+Adapters preserve selector/search diagnostics in failed `RunError.source` values, so hosts and agents can explain zero-match or ambiguous-match failures instead of only reporting that a step failed. The Windows adapter also exposes a read-only accessibility tree snapshot for a selected window, giving agents a DOM-like view of native UI structure without relying on screenshots.
+
 ## Platform support
 
-Windows is the first execution target. The Windows adapter uses native shell, window, and input APIs for application/URL/file launch, case-insensitive exact or fragment title window focus, Unicode typing, normalized key chords, and wheel scrolling. Window title selectors must resolve to exactly one visible top-level window, and focus is verified immediately after activation.
+Windows is the first execution target. The Windows adapter uses native shell, window, and input APIs for application/URL/file launch, case-insensitive exact or fragment title window focus, Unicode typing, normalized key chords, wheel scrolling, and last-resort absolute coordinate clicks. Window title selectors must resolve to exactly one visible top-level window, and focus is verified immediately after activation.
 
-Windows UI Automation provides the semantic path for `clickTarget`, targeted `typeText` and `scroll`, `windowExists` and `windowFocused`, and `targetExists` assertions. A semantic target must combine a unique window title selector with an `accessibility` selector (`id`, `name`, and/or `controlType`) that resolves to exactly one element; invocation, value assignment, scrolling, and focus inspection do not require foreground activation. Targeted key chords remain preflight-gated until their UI Automation equivalent is implemented. macOS concepts remain in the portable schema and adapter capability boundary for a later native implementation.
+Windows UI Automation provides the semantic path for `clickTarget`, targeted `typeText`, targeted `pressKey`, targeted `scroll`, `windowExists`, `windowFocused`, `targetExists`, `targetFocused`, `targetEnabled`, `targetVisible`, `targetNotExists`, `targetNameContains`, and `targetValueContains`. A semantic target must combine a unique window title selector with an `accessibility` selector (`id`, `name`, `controlType`, and/or an inspected `path`) that resolves to exactly one element. Invocation, value assignment, scrolling, and focus inspection do not require foreground activation; targeted key chords foreground and verify the semantic target before sending input. Absolute coordinate clicks use Windows screen coordinates and are intended only as a preflight-gated last resort. macOS concepts remain in the portable schema and adapter capability boundary for a later native implementation.
+
+The Windows accessibility snapshot captures a bounded UI Automation tree for a uniquely selected top-level window. Each node includes a reusable child-index `path`, depth, name, automation id, localized control type, class name, bounds, enabled/focus state, supported actions (`invoke`, `setValue`, `scroll`), selector candidates with confidence scores, and children. Current values are omitted by default to avoid leaking live user data; use the explicit inspect-only `--include-values` CLI flag only when inspecting a controlled surface. Depth and node limits are explicit so large applications are inspectable without unbounded traversal. Runtime semantic search is also bounded; path selectors use direct traversal instead of scanning the full tree. A path of `[]` intentionally targets the resolved window root; non-empty paths target descendants by child index.
 
 Windows also supports `processRunning` for an exact `processName` selector (for example, `msedge.exe`). Other target fields are rejected for process checks until process-path and application-identity matching are implemented.
 
@@ -100,4 +104,21 @@ Cueflow is in active development. Windows is the first supported execution targe
 cargo test --workspace
 ```
 
+The CLI exposes the agent-safe host surface:
+
+```powershell
+cargo run -p cueflow-cli -- capabilities
+cargo run -p cueflow-cli -- inspect-window --title-contains Google --max-depth 3 --max-nodes 150
+cargo run -p cueflow-cli -- inspect-window --title-contains Google --output .\accessibility-tree.json
+cargo run -p cueflow-cli -- screenshot --output .\screen.bmp
+cargo run -p cueflow-cli -- preflight examples\edge-demo-ready.json
+cargo run -p cueflow-cli -- run --evidence-dir .\evidence examples\edge-demo-ready.json
+```
+
+`capabilities`, `inspect-window`, `screenshot`, and `preflight` emit JSON. `inspect-window --output` writes a privacy-preserving accessibility snapshot artifact and emits its `accessibilityTree` artifact reference. `screenshot --output` captures a BMP screenshot artifact as the first visual fallback substrate. `dry-run` and `run` emit JSONL `RunEvent` values; `--evidence-dir` persists `events.jsonl` and `summary.json`.
+
+Policy-sensitive automation requires explicit run approval flags: `--allow-coordinate-targets`, `--allow-path-only-selectors`, and `--allow-value-capture`. The standalone `inspect-window --include-values` path uses its own explicit opt-in because it is a read-only inspection command, not a run/preflight policy.
+
 `examples/edge-demo-ready.json` is the first idempotent Windows reliability fixture. It returns Edge to google.com using only portable actions; run it through a Cueflow host after confirming it is safe to foreground and type into Edge.
+
+`examples/windows-settings-readiness-drill.json` is a Windows readiness/determinism drill. It opens Settings, waits for the top-level window, checks a path-bearing root target is visible, and asserts the root name still contains `Settings`.

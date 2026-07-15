@@ -1,0 +1,105 @@
+{
+  "id": "edge-search-cueflow",
+  "title": "Search Cueflow in Edge",
+  "description": "Open Google, focus the browser, type a Cueflow search URL, navigate, and wait for the result page.",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "launch-google",
+      "kind": "launchUrl",
+      "url": "https://google.com",
+      "timeout": {
+        "millis": 10000
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "delay": {
+          "millis": 500
+        },
+        "backoff": "linear"
+      },
+      "onError": "stop"
+    },
+    {
+      "id": "wait-for-google",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "windowExists",
+        "target": {
+          "titleContains": "Google"
+        }
+      },
+      "timeout": {
+        "millis": 3000
+      },
+      "retry": {
+        "maxAttempts": 3,
+        "delay": {
+          "millis": 250
+        },
+        "backoff": "linear"
+      },
+      "onError": "stop"
+    },
+    {
+      "id": "focus-google",
+      "kind": "focusWindow",
+      "target": {
+        "titleContains": "Google"
+      },
+      "timeout": {
+        "millis": 3000
+      },
+      "onError": "stop"
+    },
+    {
+      "id": "open-address-bar",
+      "kind": "pressKey",
+      "keys": "Ctrl+L",
+      "onError": "stop"
+    },
+    {
+      "id": "type-search-url",
+      "kind": "typeText",
+      "text": "https://www.google.com/search?q=cueflow+automation",
+      "onError": "stop"
+    },
+    {
+      "id": "navigate-search",
+      "kind": "pressKey",
+      "keys": "Enter",
+      "timeout": {
+        "millis": 10000
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "delay": {
+          "millis": 500
+        },
+        "backoff": "linear"
+      },
+      "onError": "stop"
+    },
+    {
+      "id": "wait-for-google-after-search",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "windowExists",
+        "target": {
+          "titleContains": "Google"
+        }
+      },
+      "timeout": {
+        "millis": 10000
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "delay": {
+          "millis": 500
+        },
+        "backoff": "linear"
+      },
+      "onError": "stop"
+    }
+  ]
+}

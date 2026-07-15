@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "cueflow-core",
  "cueflow-executor",
+ "serde",
  "windows",
 ]
 

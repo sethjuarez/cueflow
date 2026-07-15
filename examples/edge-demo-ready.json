@@ -1,13 +1,13 @@
 {
   "id": "edge-demo-ready",
   "title": "Prepare Edge demo state",
-  "description": "Return Microsoft Edge to google.com without coordinates or app-specific scripting.",
+  "description": "Return the browser to google.com without coordinates or app-specific scripting.",
   "schemaVersion": 1,
   "steps": [
     {
-      "id": "launch-edge",
-      "kind": "launchApp",
-      "app": "msedge.exe",
+      "id": "launch-google",
+      "kind": "launchUrl",
+      "url": "https://google.com",
       "timeout": {
         "millis": 10000
       },
@@ -21,12 +21,12 @@
       "onError": "stop"
     },
     {
-      "id": "wait-for-browser",
+      "id": "wait-for-google",
       "kind": "waitFor",
       "condition": {
         "kind": "windowExists",
         "target": {
-          "titleContains": "Microsoft Edge"
+          "titleContains": "Google"
         }
       },
       "timeout": {
@@ -39,10 +39,10 @@
       "onError": "stop"
     },
     {
-      "id": "focus-browser",
+      "id": "focus-google",
       "kind": "focusWindow",
       "target": {
-        "titleContains": "Microsoft Edge"
+        "titleContains": "Google"
       },
       "timeout": {
         "millis": 3000
@@ -50,42 +50,6 @@
       "retry": {
         "maxAttempts": 1,
         "backoff": "none"
-      },
-      "onError": "stop"
-    },
-    {
-      "id": "open-address-bar",
-      "kind": "pressKey",
-      "keys": "Ctrl+L",
-      "retry": {
-        "maxAttempts": 1,
-        "backoff": "none"
-      },
-      "onError": "stop"
-    },
-    {
-      "id": "enter-demo-url",
-      "kind": "typeText",
-      "text": "https://google.com",
-      "retry": {
-        "maxAttempts": 1,
-        "backoff": "none"
-      },
-      "onError": "stop"
-    },
-    {
-      "id": "navigate",
-      "kind": "pressKey",
-      "keys": "Enter",
-      "timeout": {
-        "millis": 10000
-      },
-      "retry": {
-        "maxAttempts": 2,
-        "delay": {
-          "millis": 500
-        },
-        "backoff": "linear"
       },
       "onError": "stop"
     }

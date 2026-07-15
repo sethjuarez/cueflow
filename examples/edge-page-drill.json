@@ -1,0 +1,92 @@
+{
+  "id": "edge-page-drill",
+  "title": "Interact with Google page content in Edge",
+  "description": "Open Google, type into the page search box, submit it, and wait for Google to remain available.",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "launch-google",
+      "kind": "launchUrl",
+      "url": "https://google.com",
+      "timeout": {
+        "millis": 10000
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "delay": {
+          "millis": 500
+        },
+        "backoff": "linear"
+      },
+      "onError": "stop"
+    },
+    {
+      "id": "wait-for-google",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "windowExists",
+        "target": {
+          "titleContains": "Google"
+        }
+      },
+      "timeout": {
+        "millis": 3000
+      },
+      "onError": "stop"
+    },
+    {
+      "id": "focus-google-page",
+      "kind": "focusWindow",
+      "target": {
+        "titleContains": "Google"
+      },
+      "timeout": {
+        "millis": 3000
+      },
+      "retry": {
+        "maxAttempts": 3,
+        "delay": {
+          "millis": 250
+        },
+        "backoff": "linear"
+      },
+      "onError": "stop"
+    },
+    {
+      "id": "type-into-google-page",
+      "kind": "typeText",
+      "text": "cueflow automation",
+      "onError": "stop"
+    },
+    {
+      "id": "submit-google-search",
+      "kind": "pressKey",
+      "keys": "Enter",
+      "timeout": {
+        "millis": 3000
+      },
+      "onError": "stop"
+    },
+    {
+      "id": "wait-for-google-after-submit",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "windowExists",
+        "target": {
+          "titleContains": "Google"
+        }
+      },
+      "timeout": {
+        "millis": 5000
+      },
+      "retry": {
+        "maxAttempts": 2,
+        "delay": {
+          "millis": 500
+        },
+        "backoff": "linear"
+      },
+      "onError": "stop"
+    }
+  ]
+}

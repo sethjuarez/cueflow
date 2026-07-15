@@ -9,6 +9,10 @@ use serde_json::Value;
 const AUTOMATION_V1: &str = include_str!("fixtures/automation-v1.json");
 const AUTOMATION_V0: &str = include_str!("fixtures/automation-v0.json");
 const EDGE_DEMO_READY: &str = include_str!("../../../examples/edge-demo-ready.json");
+const EDGE_PAGE_DRILL: &str = include_str!("../../../examples/edge-page-drill.json");
+const EDGE_SEARCH_CUEFLOW: &str = include_str!("../../../examples/edge-search-cueflow.json");
+const WINDOWS_SETTINGS_READINESS_DRILL: &str =
+    include_str!("../../../examples/windows-settings-readiness-drill.json");
 
 #[test]
 fn v1_fixture_is_a_stable_json_round_trip() {
@@ -99,6 +103,37 @@ fn edge_demo_fixture_remains_a_valid_portable_definition() {
 }
 
 #[test]
+fn edge_search_fixture_remains_a_valid_portable_definition() {
+    let definition =
+        parse_definition_json(EDGE_SEARCH_CUEFLOW).expect("edge search fixture parses");
+
+    assert_eq!(definition.id, "edge-search-cueflow");
+    assert_eq!(
+        definition.portability(),
+        cueflow_core::Portability::Portable
+    );
+}
+
+#[test]
+fn edge_page_drill_fixture_remains_a_valid_portable_definition() {
+    let definition = parse_definition_json(EDGE_PAGE_DRILL).expect("edge page drill parses");
+
+    assert_eq!(definition.id, "edge-page-drill");
+    assert_eq!(
+        definition.portability(),
+        cueflow_core::Portability::Portable
+    );
+}
+
+#[test]
+fn windows_settings_readiness_drill_remains_a_valid_definition() {
+    let definition =
+        parse_definition_json(WINDOWS_SETTINGS_READINESS_DRILL).expect("settings drill parses");
+
+    assert_eq!(definition.id, "windows-settings-readiness-drill");
+}
+
+#[test]
 fn platform_selector_replaces_generic_target_fields_for_execution() {
     let action = Action::FocusWindow {
         target: Target {
@@ -130,4 +165,43 @@ fn platform_selector_replaces_generic_target_fields_for_execution() {
     assert!(target.app_name.is_none());
     assert!(target.title_contains.is_none());
     assert!(target.platform_selectors.is_empty());
+}
+
+#[test]
+fn accessibility_path_can_stabilize_a_target_without_textual_identifiers() {
+    let document = serde_json::json!({
+        "id": "path-target",
+        "title": "Path target",
+        "schemaVersion": 1,
+        "steps": [{
+            "id": "wait-for-path",
+            "kind": "waitFor",
+            "condition": {
+                "kind": "targetExists",
+                "target": {
+                    "windowTitle": "GitHub Copilot",
+                    "accessibility": {
+                        "path": [1, 0, 2]
+                    }
+                }
+            }
+        }]
+    });
+
+    let definition = parse_definition_json(&document.to_string()).expect("path selector parses");
+    let condition = match &definition.steps[0].action {
+        Action::WaitFor { condition } => condition,
+        _ => panic!("step remains a wait"),
+    };
+
+    let cueflow_core::WaitCondition::TargetExists { target } = condition else {
+        panic!("condition remains a target existence wait");
+    };
+    assert_eq!(
+        target
+            .accessibility
+            .as_ref()
+            .and_then(|accessibility| accessibility.path.as_deref()),
+        Some([1, 0, 2].as_slice())
+    );
 }

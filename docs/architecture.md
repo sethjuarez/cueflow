@@ -22,11 +22,12 @@ Cueflow is layered so portable workflow definitions remain independent from plat
    - Polls adapter-backed wait conditions and maps failed assertions to structured run errors.
    - Stops on failure by default, emits `manualIntervention` for `prompt`, and only continues when explicitly configured.
    - Skips platform calls when `RunConfig.dryRun` is true.
+   - Preserves adapter diagnostics in structured run errors so hosts can surface selector candidates and failure context.
    - Adds `tracing` fields apps can map into observability tools.
 
 3. `cueflow-adapters`
-   - Defines the platform boundary for launch, focus, input, window, and process operations through the executor adapter trait.
-   - Ships a Windows-first module behind `cfg(windows)` for native shell launch, exact-title window focus/query, `SendInput` text/key/scroll injection, and file existence checks.
+   - Defines the platform boundary for launch, focus, input, window, process, and read-only accessibility inspection operations.
+   - Ships a Windows-first module behind `cfg(windows)` for native shell launch, exact-title window focus/query, `SendInput` text/key/scroll injection, targeted UI Automation key focus/readiness checks, bounded path-bearing UI Automation tree capture, selector candidate generation, screenshot capture, last-resort absolute coordinate clicks, and file existence checks.
    - Rejects unsupported selector shapes and UI Automation-dependent actions during preflight instead of silently ignoring constraints.
    - Retains no-op/non-Windows adapters while macOS and Linux implementations are added behind the same portable contract.
 
@@ -58,5 +59,8 @@ flowchart LR
 - Semantic actions are the happy path.
 - Platform overrides are explicit and local to steps or targets.
 - Windows, macOS, and Linux behavior belongs below the portable schema.
-- Coordinates are allowed as a last-resort target, not a default modeling strategy.
-- Output video, screenshots, and logs are artifacts, not the automation definition itself.
+- Coordinates are allowed as a last-resort target, not a default modeling strategy; Windows interprets them as absolute screen coordinates.
+- Accessibility tree inspection is read-only, bounded by depth and node count, omits element values by default, and should feed authoring/agent planning rather than become an opaque replay artifact. Accessibility node paths can be reused as stable-enough selectors when names or automation ids are absent, but selectors still fail closed on no-match, ambiguity, disabled/offscreen targets, focus denial, or truncated semantic search.
+- Host policy controls gate fragile or sensitive behavior. Coordinate targets, path-only selectors, and runtime value reads require explicit run approval. Read-only accessibility inspection has a separate `--include-values` opt-in for controlled surfaces.
+- Accessibility paths are generated from Windows UI Automation child indexes. `[]` targets the resolved window root; non-empty paths target descendants and should be paired with semantic facts such as control type whenever possible.
+- Output video, screenshots, accessibility trees, and logs are artifacts, not the automation definition itself.

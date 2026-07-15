@@ -1,10 +1,15 @@
+use std::collections::BTreeMap;
+use std::fs;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::AdapterCapabilities;
+use crate::{
+    AccessibilityBounds, AccessibilityNode, AccessibilitySelectorCandidate, AccessibilityTree,
+    AdapterCapabilities, SelectorConfidence,
+};
 use cueflow_core::{
     Action, Artifact, Assertion, Platform, PreflightDiagnostic, PreflightSeverity, RunConfig,
     Target, WaitCondition,
@@ -12,7 +17,12 @@ use cueflow_core::{
 use cueflow_executor::{AdapterError, ConditionState, ExecutionAdapter, RunControl};
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HWND, INVALID_HANDLE_VALUE, LPARAM, RPC_E_CHANGED_MODE},
+        Foundation::{CloseHandle, HWND, INVALID_HANDLE_VALUE, LPARAM, RECT, RPC_E_CHANGED_MODE},
+        Graphics::Gdi::{
+            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap,
+            CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDIBits, GetWindowDC,
+            ReleaseDC, SRCCOPY, SelectObject,
+        },
         System::Com::{
             CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
             CoUninitialize,
@@ -24,29 +34,35 @@ use windows::{
         System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject},
         UI::{
             Accessibility::{
-                CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
-                IUIAutomationScrollPattern, IUIAutomationValuePattern, ScrollAmount,
-                ScrollAmount_NoAmount, ScrollAmount_SmallDecrement, ScrollAmount_SmallIncrement,
-                TreeScope_Subtree, UIA_InvokePatternId, UIA_ScrollPatternId, UIA_ValuePatternId,
+                CUIAutomation, IUIAutomation, IUIAutomationCondition, IUIAutomationElement,
+                IUIAutomationInvokePattern, IUIAutomationScrollPattern, IUIAutomationValuePattern,
+                ScrollAmount, ScrollAmount_NoAmount, ScrollAmount_SmallDecrement,
+                ScrollAmount_SmallIncrement, TreeScope_Children, UIA_InvokePatternId,
+                UIA_ScrollPatternId, UIA_ValuePatternId,
             },
             Input::KeyboardAndMouse::{
                 INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_KEYUP,
-                KEYEVENTF_UNICODE, MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_BACK,
-                VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_MENU,
-                VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+                KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_WHEEL,
+                MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN,
+                VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT,
+                VK_SPACE, VK_TAB, VK_UP,
             },
             Shell::ShellExecuteW,
             WindowsAndMessaging::{
-                EnumWindows, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
-                IsWindowVisible, SW_SHOWNORMAL, SetForegroundWindow,
+                EnumWindows, GetDesktopWindow, GetForegroundWindow, GetSystemMetrics,
+                GetWindowTextLengthW, GetWindowTextW, IsWindowVisible, SM_CXSCREEN, SM_CYSCREEN,
+                SW_SHOWNORMAL, SetCursorPos, SetForegroundWindow,
             },
         },
     },
-    core::{BOOL, BSTR, HSTRING},
+    core::{BOOL, BSTR, HSTRING, Interface},
 };
 
 #[derive(Debug, Default)]
 pub struct WindowsDesktopAdapter;
+
+const SEMANTIC_SEARCH_MAX_DEPTH: u32 = 16;
+const SEMANTIC_SEARCH_MAX_NODES: usize = 2_000;
 
 impl WindowsDesktopAdapter {
     pub fn capabilities() -> AdapterCapabilities {
@@ -56,9 +72,131 @@ impl WindowsDesktopAdapter {
             supports_focus: true,
             supports_input: true,
             supports_semantic_targets: true,
+            supports_coordinate_targets: true,
             supports_window_queries: true,
             supports_process_queries: true,
+            supports_accessibility_tree: true,
         }
+    }
+
+    pub fn inspect_window(
+        &self,
+        target: &Target,
+        max_depth: u32,
+        max_nodes: usize,
+    ) -> Result<AccessibilityTree, AdapterError> {
+        self.inspect_window_with_options(target, max_depth, max_nodes, false)
+    }
+
+    pub fn inspect_window_with_options(
+        &self,
+        target: &Target,
+        max_depth: u32,
+        max_nodes: usize,
+        include_values: bool,
+    ) -> Result<AccessibilityTree, AdapterError> {
+        let window = find_window(target)?;
+        let window_title = window_title(window)?;
+        let selector = window_target_summary(target);
+        let max_nodes = max_nodes.max(1);
+
+        let initialization = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        let should_uninitialize = initialization.is_ok();
+        if !should_uninitialize && initialization != RPC_E_CHANGED_MODE {
+            return Err(AdapterError::new(
+                "Windows could not initialize UI Automation",
+            ));
+        }
+
+        let result = (|| {
+            let automation: IUIAutomation = unsafe {
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).map_err(|_| {
+                    AdapterError::new("Windows could not create a UI Automation client")
+                })?
+            };
+            let root = unsafe {
+                automation.ElementFromHandle(window).map_err(|_| {
+                    AdapterError::new("Windows could not inspect the requested window")
+                })?
+            };
+            let condition = unsafe {
+                automation.CreateTrueCondition().map_err(|_| {
+                    AdapterError::new("Windows could not create a UI Automation query")
+                })?
+            };
+            let mut remaining = max_nodes;
+            let mut truncated = false;
+            let root = inspect_accessibility_node(
+                &root,
+                &condition,
+                &[],
+                &window_title,
+                max_depth,
+                include_values,
+                &mut remaining,
+                &mut truncated,
+            )?;
+
+            Ok(AccessibilityTree {
+                platform: Platform::Windows,
+                window_title,
+                selector,
+                max_depth,
+                max_nodes,
+                truncated,
+                root,
+            })
+        })();
+
+        if should_uninitialize {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+
+        result
+    }
+
+    pub fn capture_screenshot(&self, path: impl AsRef<Path>) -> Result<Artifact, AdapterError> {
+        capture_desktop_screenshot(path.as_ref())
+    }
+}
+
+fn window_search_diagnostics(target: &Target, windows: &[HWND]) -> String {
+    let candidates = windows
+        .iter()
+        .take(8)
+        .filter_map(|window| {
+            window_title(*window)
+                .ok()
+                .map(|title| format!("{} ({window:?})", quote(&title)))
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "selector: {}; visible window matches: {}",
+        window_target_summary(target),
+        list_or_none(&candidates)
+    )
+}
+
+fn window_target_summary(target: &Target) -> String {
+    let mut fields = Vec::new();
+    if let Some(title) = &target.window_title {
+        fields.push(format!("windowTitle={}", quote(title)));
+    }
+    if let Some(title) = &target.title_contains {
+        fields.push(format!("titleContains={}", quote(title)));
+    }
+    if let Some(process_name) = &target.process_name {
+        fields.push(format!("processName={}", quote(process_name)));
+    }
+    if let Some(app_name) = &target.app_name {
+        fields.push(format!("appName={}", quote(app_name)));
+    }
+    if fields.is_empty() {
+        "no supported window selector fields".to_string()
+    } else {
+        fields.join(", ")
     }
 }
 
@@ -79,15 +217,24 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
                 .set_target_text(target, text, config)
                 .map(|_| Vec::new()),
             Action::TypeText { text, target: None } => send_text(text).map(|_| Vec::new()),
-            Action::PressKey { keys, .. } => send_key_chord(keys).map(|_| Vec::new()),
+            Action::PressKey {
+                keys,
+                target: Some(target),
+            } => focus_target(target, config)
+                .and_then(|_| send_key_chord(keys))
+                .map(|_| Vec::new()),
+            Action::PressKey { keys, target: None } => send_key_chord(keys).map(|_| Vec::new()),
             Action::Scroll { delta_y, .. } => send_scroll(*delta_y).map(|_| Vec::new()),
+            Action::ClickTarget { target } if target.coordinates.is_some() => {
+                click_coordinates(target).map(|_| Vec::new())
+            }
             Action::ClickTarget { target } => {
                 self.invoke_target(target, config).map(|_| Vec::new())
             }
             Action::RunCommand { command, args } => {
                 run_command(command, args, config, &RunControl::default(), None).map(|_| Vec::new())
             }
-            Action::OpenFile { path, .. } => shell_open(path),
+            Action::OpenFile { path, .. } => shell_open_file(path),
             _ => Err(AdapterError::unsupported(format!(
                 "Windows adapter does not yet support {}",
                 action.kind()
@@ -131,6 +278,25 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
                     ConditionState::Pending
                 }
             }),
+            WaitCondition::TargetExists { target } => target_exists_state(target),
+            WaitCondition::TargetFocused { target } => {
+                semantic_target_focused(target).map(condition_state)
+            }
+            WaitCondition::TargetEnabled { target } => {
+                semantic_target_enabled(target).map(condition_state)
+            }
+            WaitCondition::TargetVisible { target } => {
+                semantic_target_visible(target).map(condition_state)
+            }
+            WaitCondition::TargetNotExists { target } => {
+                semantic_target_exists(target).map(|exists| condition_state(!exists))
+            }
+            WaitCondition::TargetNameContains { target, text } => {
+                semantic_target_name_contains(target, text).map(condition_state)
+            }
+            WaitCondition::TargetValueContains { target, text } => {
+                semantic_target_value_contains(target, text).map(condition_state)
+            }
             WaitCondition::ProcessRunning { target } => process_is_running(target).map(|running| {
                 if running {
                     ConditionState::Satisfied
@@ -215,6 +381,7 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
 
     fn invoke_target(&mut self, target: &Target, _config: &RunConfig) -> Result<(), AdapterError> {
         with_semantic_target(target, |element| {
+            ensure_semantic_target_actionable(element)?;
             let pattern = unsafe {
                 element.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
             }
@@ -233,6 +400,7 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
         _config: &RunConfig,
     ) -> Result<(), AdapterError> {
         with_semantic_target(target, |element| {
+            ensure_semantic_target_actionable(element)?;
             let pattern = unsafe {
                 element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
             }
@@ -249,12 +417,7 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
         target: &Target,
         _config: &RunConfig,
     ) -> Result<bool, AdapterError> {
-        with_semantic_target(target, |element| unsafe {
-            element
-                .CurrentHasKeyboardFocus()
-                .map(|focused| focused.as_bool())
-                .map_err(|_| AdapterError::new("Windows could read semantic target focus state"))
-        })
+        semantic_target_focused(target)
     }
 
     fn scroll_target(
@@ -265,6 +428,7 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
         _config: &RunConfig,
     ) -> Result<(), AdapterError> {
         with_semantic_target(target, |element| {
+            ensure_semantic_target_actionable(element)?;
             let pattern = unsafe {
                 element.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId)
             }
@@ -356,6 +520,35 @@ fn send_scroll(delta_y: i32) -> Result<(), AdapterError> {
     send_inputs(&[input])
 }
 
+fn click_coordinates(target: &Target) -> Result<(), AdapterError> {
+    let coordinates = target
+        .coordinates
+        .ok_or_else(|| AdapterError::unsupported("coordinate clicks require coordinates"))?;
+    unsafe { SetCursorPos(coordinates.x, coordinates.y) }
+        .map_err(|_| AdapterError::new("Windows could not move the pointer to the target"))?;
+    let inputs = [
+        INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dwFlags: MOUSEEVENTF_LEFTDOWN,
+                    ..Default::default()
+                },
+            },
+        },
+        INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dwFlags: MOUSEEVENTF_LEFTUP,
+                    ..Default::default()
+                },
+            },
+        },
+    ];
+    send_inputs(&inputs)
+}
+
 fn keyboard_input(
     virtual_key: VIRTUAL_KEY,
     scan_code: u16,
@@ -422,6 +615,178 @@ fn shell_open(target: &str) -> Result<Vec<Artifact>, AdapterError> {
     Ok(Vec::new())
 }
 
+fn shell_open_file(path: &str) -> Result<Vec<Artifact>, AdapterError> {
+    let path = Path::new(path);
+    let path = path
+        .canonicalize()
+        .map_err(|_| AdapterError::new("Windows could not resolve the requested file"))?;
+    shell_open(&strip_verbatim_path_prefix(&path.to_string_lossy()))
+}
+
+fn strip_verbatim_path_prefix(path: &str) -> String {
+    path.strip_prefix(r"\\?\").unwrap_or(path).to_string()
+}
+
+fn capture_desktop_screenshot(path: &Path) -> Result<Artifact, AdapterError> {
+    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    if width <= 0 || height <= 0 {
+        return Err(AdapterError::new(
+            "Windows could not determine screen dimensions",
+        ));
+    }
+
+    let desktop = unsafe { GetDesktopWindow() };
+    let screen_dc = unsafe { GetWindowDC(Some(desktop)) };
+    if screen_dc.is_invalid() {
+        return Err(AdapterError::new(
+            "Windows could not acquire the screen device context",
+        ));
+    }
+
+    let result = (|| {
+        let memory_dc = unsafe { CreateCompatibleDC(Some(screen_dc)) };
+        if memory_dc.is_invalid() {
+            return Err(AdapterError::new(
+                "Windows could not create a screenshot device context",
+            ));
+        }
+        let bitmap = unsafe { CreateCompatibleBitmap(screen_dc, width, height) };
+        if bitmap.is_invalid() {
+            unsafe {
+                let _ = DeleteDC(memory_dc);
+            }
+            return Err(AdapterError::new(
+                "Windows could not create a screenshot bitmap",
+            ));
+        }
+
+        let previous_object = unsafe { SelectObject(memory_dc, bitmap.into()) };
+        if previous_object.is_invalid() {
+            unsafe {
+                let _ = DeleteObject(bitmap.into());
+                let _ = DeleteDC(memory_dc);
+            }
+            return Err(AdapterError::new(
+                "Windows could not select the screenshot bitmap",
+            ));
+        }
+
+        let result = (|| {
+            unsafe {
+                BitBlt(
+                    memory_dc,
+                    0,
+                    0,
+                    width,
+                    height,
+                    Some(screen_dc),
+                    0,
+                    0,
+                    SRCCOPY,
+                )
+                .map_err(|_| AdapterError::new("Windows could not capture the screen"))?;
+            }
+
+            let pixels = bitmap_pixels(memory_dc, bitmap, width, height)?;
+            write_bmp(path, width, height, &pixels)?;
+            Ok(Artifact {
+                kind: cueflow_core::ArtifactKind::Screenshot,
+                uri: format!("file://{}", strip_verbatim_path_prefix(&path_display(path))),
+                label: Some("Desktop screenshot".to_string()),
+            })
+        })();
+
+        unsafe {
+            let _ = SelectObject(memory_dc, previous_object);
+            let _ = DeleteObject(bitmap.into());
+            let _ = DeleteDC(memory_dc);
+        }
+        result
+    })();
+
+    unsafe {
+        let _ = ReleaseDC(Some(desktop), screen_dc);
+    }
+    result
+}
+
+fn bitmap_pixels(
+    memory_dc: windows::Win32::Graphics::Gdi::HDC,
+    bitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+    width: i32,
+    height: i32,
+) -> Result<Vec<u8>, AdapterError> {
+    let buffer_size = width as usize * height as usize * 4;
+    let mut info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: buffer_size as u32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut pixels = vec![0u8; buffer_size];
+    let rows = unsafe {
+        GetDIBits(
+            memory_dc,
+            bitmap,
+            0,
+            height as u32,
+            Some(pixels.as_mut_ptr().cast()),
+            &mut info,
+            DIB_RGB_COLORS,
+        )
+    };
+    if rows == 0 {
+        return Err(AdapterError::new(
+            "Windows could not read screenshot pixels",
+        ));
+    }
+    Ok(pixels)
+}
+
+fn write_bmp(path: &Path, width: i32, height: i32, pixels: &[u8]) -> Result<(), AdapterError> {
+    let header_size = 14usize + 40usize;
+    let file_size = header_size + pixels.len();
+    let mut output = Vec::with_capacity(file_size);
+    output.extend_from_slice(b"BM");
+    output.extend_from_slice(&(file_size as u32).to_le_bytes());
+    output.extend_from_slice(&[0, 0, 0, 0]);
+    output.extend_from_slice(&(header_size as u32).to_le_bytes());
+    output.extend_from_slice(&40u32.to_le_bytes());
+    output.extend_from_slice(&width.to_le_bytes());
+    output.extend_from_slice(&(-height).to_le_bytes());
+    output.extend_from_slice(&1u16.to_le_bytes());
+    output.extend_from_slice(&32u16.to_le_bytes());
+    output.extend_from_slice(&0u32.to_le_bytes());
+    output.extend_from_slice(&(pixels.len() as u32).to_le_bytes());
+    output.extend_from_slice(&2835u32.to_le_bytes());
+    output.extend_from_slice(&2835u32.to_le_bytes());
+    output.extend_from_slice(&0u32.to_le_bytes());
+    output.extend_from_slice(&0u32.to_le_bytes());
+    output.extend_from_slice(pixels);
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|_| {
+            AdapterError::new("Windows could not create the screenshot output directory")
+        })?;
+    }
+    fs::write(path, output).map_err(|_| AdapterError::new("Windows could not write screenshot"))
+}
+
+fn path_display(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
 fn focus_window(target: &Target) -> Result<(), AdapterError> {
     let window = find_window(target)?;
     unsafe {
@@ -430,19 +795,27 @@ fn focus_window(target: &Target) -> Result<(), AdapterError> {
                 "Windows could not focus the requested window",
             ));
         }
-        if GetForegroundWindow() != window {
-            return Err(AdapterError::new(
-                "Windows did not foreground the requested window",
-            ));
-        }
     }
-    Ok(())
+    wait_for_foreground(window, "requested window")
+}
+
+fn wait_for_foreground(window: HWND, label: &str) -> Result<(), AdapterError> {
+    let started_at = Instant::now();
+    while started_at.elapsed() < Duration::from_millis(750) {
+        if unsafe { GetForegroundWindow() == window } {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(AdapterError::new(format!(
+        "Windows did not foreground the {label}"
+    )))
 }
 
 fn window_exists(target: &Target) -> Result<bool, AdapterError> {
     match find_window(target) {
         Ok(_) => Ok(true),
-        Err(error) if error.to_string() == "requested window was not found" => Ok(false),
+        Err(error) if has_failure_kind(&error, "notFound") => Ok(false),
         Err(error) => Err(error),
     }
 }
@@ -450,7 +823,7 @@ fn window_exists(target: &Target) -> Result<bool, AdapterError> {
 fn window_is_focused(target: &Target) -> Result<bool, AdapterError> {
     let window = match find_window(target) {
         Ok(window) => window,
-        Err(error) if error.to_string() == "requested window was not found" => return Ok(false),
+        Err(error) if has_failure_kind(&error, "notFound") => return Ok(false),
         Err(error) => return Err(error),
     };
 
@@ -488,6 +861,119 @@ fn process_is_running(target: &Target) -> Result<bool, AdapterError> {
             .map_err(|_| AdapterError::new("Windows could close the process snapshot"))?;
     }
     result
+}
+
+fn focus_target(target: &Target, _config: &RunConfig) -> Result<(), AdapterError> {
+    let window = find_semantic_window(target)?;
+    unsafe {
+        if !SetForegroundWindow(window).as_bool() {
+            return Err(AdapterError::new(
+                "Windows could not foreground the semantic target window",
+            ));
+        }
+    }
+    wait_for_foreground(window, "semantic target window")?;
+    with_semantic_target(target, |element| unsafe {
+        ensure_semantic_target_actionable(element)?;
+        element.SetFocus().map_err(|_| {
+            AdapterError::new("Windows could not focus the requested semantic target")
+        })?;
+        if element
+            .CurrentHasKeyboardFocus()
+            .map_err(|_| AdapterError::new("Windows could verify semantic target focus"))?
+            .as_bool()
+        {
+            Ok(())
+        } else {
+            Err(AdapterError::new(
+                "Windows did not give keyboard focus to the requested semantic target",
+            )
+            .with_source("failureKind=focusDenied"))
+        }
+    })
+}
+
+fn semantic_search_diagnostics(
+    target: &Target,
+    accessibility: &cueflow_core::AccessibilityTarget,
+    matched: &[String],
+    inspected: &[String],
+) -> String {
+    format!(
+        "window selector: {}; accessibility selector: {}; matched elements: {}; inspected elements: {}",
+        window_target_summary(target),
+        accessibility_summary(accessibility),
+        list_or_none(matched),
+        list_or_none(inspected)
+    )
+}
+
+fn accessibility_summary(accessibility: &cueflow_core::AccessibilityTarget) -> String {
+    let mut fields = Vec::new();
+    if let Some(id) = &accessibility.id {
+        fields.push(format!("id={}", quote(id)));
+    }
+    if let Some(name) = &accessibility.name {
+        fields.push(format!("name={}", quote(name)));
+    }
+    if let Some(control_type) = &accessibility.control_type {
+        fields.push(format!("controlType={}", quote(control_type)));
+    }
+    if let Some(path) = &accessibility.path {
+        fields.push(format!("path={}", format_accessibility_path(path)));
+    }
+    fields.join(", ")
+}
+
+fn element_summary(element: &IUIAutomationElement, path: &[u32]) -> Result<String, AdapterError> {
+    let id = unsafe {
+        element
+            .CurrentAutomationId()
+            .map_err(|_| AdapterError::new("Windows could read a target automation id"))?
+    };
+    let name = unsafe {
+        element
+            .CurrentName()
+            .map_err(|_| AdapterError::new("Windows could read a target name"))?
+    };
+    let control_type = unsafe {
+        element
+            .CurrentLocalizedControlType()
+            .map_err(|_| AdapterError::new("Windows could read a target control type"))?
+    };
+    Ok(format!(
+        "path={}, id={}, name={}, controlType={}",
+        format_accessibility_path(path),
+        quote(&id.to_string()),
+        quote(&name.to_string()),
+        quote(&control_type.to_string())
+    ))
+}
+
+fn format_accessibility_path(path: &[u32]) -> String {
+    if path.is_empty() {
+        "[]".to_string()
+    } else {
+        format!(
+            "[{}]",
+            path.iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
+}
+
+fn list_or_none(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join("; ")
+    }
+}
+
+fn quote(value: &str) -> String {
+    format!("{value:?}")
 }
 
 fn process_name(target: &Target) -> Result<&str, AdapterError> {
@@ -643,11 +1129,20 @@ fn find_window(target: &Target) -> Result<HWND, AdapterError> {
     }
 
     match search.matches.as_slice() {
-        [] => Err(AdapterError::new("requested window was not found")),
+        [] => Err(
+            AdapterError::new("requested window was not found").with_source(format!(
+                "failureKind=notFound; {}",
+                window_search_diagnostics(target, &search.matches)
+            )),
+        ),
         [window] => Ok(*window),
-        _ => Err(AdapterError::new(
-            "requested window selector matched multiple visible windows",
-        )),
+        _ => Err(
+            AdapterError::new("requested window selector matched multiple visible windows")
+                .with_source(format!(
+                    "failureKind=ambiguous; {}",
+                    window_search_diagnostics(target, &search.matches)
+                )),
+        ),
     }
 }
 
@@ -751,9 +1246,423 @@ fn window_title(window: HWND) -> Result<String, AdapterError> {
 fn semantic_target_exists(target: &Target) -> Result<bool, AdapterError> {
     match with_semantic_target(target, |_| Ok(())) {
         Ok(()) => Ok(true),
-        Err(error) if error.to_string() == "requested semantic target was not found" => Ok(false),
+        Err(error) if is_target_absent(&error) => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+fn ensure_semantic_target_actionable(element: &IUIAutomationElement) -> Result<(), AdapterError> {
+    let enabled = unsafe {
+        element
+            .CurrentIsEnabled()
+            .map_err(|_| AdapterError::new("Windows could not verify target enabled state"))?
+            .as_bool()
+    };
+    if !enabled {
+        return Err(
+            AdapterError::new("semantic target is disabled").with_source("failureKind=disabled")
+        );
+    }
+
+    let offscreen = unsafe {
+        element
+            .CurrentIsOffscreen()
+            .map_err(|_| AdapterError::new("Windows could not verify target visibility state"))?
+            .as_bool()
+    };
+    if offscreen {
+        return Err(
+            AdapterError::new("semantic target is offscreen").with_source("failureKind=offscreen")
+        );
+    }
+
+    Ok(())
+}
+
+fn target_exists_state(target: &Target) -> Result<ConditionState, AdapterError> {
+    semantic_target_exists(target).map(condition_state)
+}
+
+fn condition_state(satisfied: bool) -> ConditionState {
+    if satisfied {
+        ConditionState::Satisfied
+    } else {
+        ConditionState::Pending
+    }
+}
+
+fn semantic_target_focused(target: &Target) -> Result<bool, AdapterError> {
+    semantic_target_readiness(target, |element| unsafe {
+        element
+            .CurrentHasKeyboardFocus()
+            .map(|focused| focused.as_bool())
+            .map_err(|_| AdapterError::new("Windows could read semantic target focus state"))
+    })
+}
+
+fn semantic_target_enabled(target: &Target) -> Result<bool, AdapterError> {
+    semantic_target_readiness(target, |element| unsafe {
+        element
+            .CurrentIsEnabled()
+            .map(|enabled| enabled.as_bool())
+            .map_err(|_| AdapterError::new("Windows could read semantic target enabled state"))
+    })
+}
+
+fn semantic_target_visible(target: &Target) -> Result<bool, AdapterError> {
+    semantic_target_readiness(target, |element| unsafe {
+        element
+            .CurrentIsOffscreen()
+            .map(|offscreen| !offscreen.as_bool())
+            .map_err(|_| AdapterError::new("Windows could read semantic target visibility state"))
+    })
+}
+
+fn semantic_target_name_contains(target: &Target, text: &str) -> Result<bool, AdapterError> {
+    semantic_target_readiness(target, |element| unsafe {
+        element
+            .CurrentName()
+            .map(|name| name.to_string().contains(text))
+            .map_err(|_| AdapterError::new("Windows could read semantic target name"))
+    })
+}
+
+fn semantic_target_value_contains(target: &Target, text: &str) -> Result<bool, AdapterError> {
+    semantic_target_readiness(target, |element| {
+        Ok(current_value(element, true)
+            .as_deref()
+            .is_some_and(|value| value.contains(text)))
+    })
+}
+
+fn semantic_target_readiness(
+    target: &Target,
+    operation: impl FnOnce(&IUIAutomationElement) -> Result<bool, AdapterError>,
+) -> Result<bool, AdapterError> {
+    match with_semantic_target(target, operation) {
+        Ok(satisfied) => Ok(satisfied),
+        Err(error) if is_target_absent(&error) => Ok(false),
+        Err(error) if is_transient_readiness_error(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_target_absent(error: &AdapterError) -> bool {
+    has_failure_kind(error, "notFound")
+}
+
+fn is_transient_readiness_error(error: &AdapterError) -> bool {
+    error.diagnostics().is_none() && error.to_string().starts_with("Windows could ")
+}
+
+fn has_failure_kind(error: &AdapterError, kind: &str) -> bool {
+    let Some(diagnostics) = error.diagnostics() else {
+        return false;
+    };
+    diagnostics
+        .split(';')
+        .next()
+        .is_some_and(|field| field.trim() == format!("failureKind={kind}"))
+}
+
+fn inspect_accessibility_node(
+    element: &IUIAutomationElement,
+    condition: &IUIAutomationCondition,
+    path: &[u32],
+    window_title: &str,
+    depth_remaining: u32,
+    include_values: bool,
+    remaining_nodes: &mut usize,
+    truncated: &mut bool,
+) -> Result<AccessibilityNode, AdapterError> {
+    if *remaining_nodes == 0 {
+        *truncated = true;
+        return Err(AdapterError::new(
+            "Windows accessibility inspection exceeded the node limit",
+        ));
+    }
+    *remaining_nodes -= 1;
+
+    let mut children = Vec::new();
+    if depth_remaining > 0 {
+        let Ok(child_elements) = (unsafe { element.FindAll(TreeScope_Children, condition) }) else {
+            *truncated = true;
+            return Ok(inspected_accessibility_node(
+                element,
+                path,
+                window_title,
+                include_values,
+                children,
+            ));
+        };
+        let Ok(child_count) = (unsafe { child_elements.Length() }) else {
+            *truncated = true;
+            return Ok(inspected_accessibility_node(
+                element,
+                path,
+                window_title,
+                include_values,
+                children,
+            ));
+        };
+        for index in 0..child_count {
+            if *remaining_nodes == 0 {
+                *truncated = true;
+                break;
+            }
+            let Ok(child) = (unsafe { child_elements.GetElement(index) }) else {
+                *truncated = true;
+                continue;
+            };
+            children.push(inspect_accessibility_node(
+                &child,
+                condition,
+                &[path, &[index as u32]].concat(),
+                window_title,
+                depth_remaining - 1,
+                include_values,
+                remaining_nodes,
+                truncated,
+            )?);
+        }
+    } else {
+        match has_children(element, condition) {
+            Ok(true) => *truncated = true,
+            Ok(false) => {}
+            Err(_) => *truncated = true,
+        }
+    }
+
+    Ok(inspected_accessibility_node(
+        element,
+        path,
+        window_title,
+        include_values,
+        children,
+    ))
+}
+
+fn inspected_accessibility_node(
+    element: &IUIAutomationElement,
+    path: &[u32],
+    window_title: &str,
+    include_values: bool,
+    children: Vec<AccessibilityNode>,
+) -> AccessibilityNode {
+    let name = current_bstr(element, |element| unsafe { element.CurrentName() });
+    let automation_id = current_bstr(element, |element| unsafe { element.CurrentAutomationId() });
+    let control_type = current_bstr(element, |element| unsafe {
+        element.CurrentLocalizedControlType()
+    });
+    AccessibilityNode {
+        path: path.to_vec(),
+        depth: path.len() as u32,
+        name: name.clone(),
+        automation_id: automation_id.clone(),
+        control_type: control_type.clone(),
+        class_name: current_bstr(element, |element| unsafe { element.CurrentClassName() }),
+        bounds: current_bounds(element),
+        enabled: current_bool(element, |element| unsafe { element.CurrentIsEnabled() }),
+        keyboard_focusable: current_bool(element, |element| unsafe {
+            element.CurrentIsKeyboardFocusable()
+        }),
+        has_keyboard_focus: current_bool(element, |element| unsafe {
+            element.CurrentHasKeyboardFocus()
+        }),
+        value: current_value(element, include_values),
+        actions: current_actions(element),
+        selector_candidates: selector_candidates(
+            window_title,
+            path,
+            &automation_id,
+            &name,
+            &control_type,
+        ),
+        children,
+    }
+}
+
+fn selector_candidates(
+    window_title: &str,
+    path: &[u32],
+    automation_id: &str,
+    name: &str,
+    control_type: &str,
+) -> Vec<AccessibilitySelectorCandidate> {
+    let mut candidates = Vec::new();
+    if !automation_id.is_empty() && !control_type.is_empty() {
+        candidates.push(selector_candidate(
+            window_title,
+            Some(automation_id),
+            None,
+            Some(control_type),
+            None,
+            SelectorConfidence::High,
+            95,
+            "Automation id plus control type is usually the most stable UIA selector.",
+            Vec::new(),
+        ));
+    }
+    if !automation_id.is_empty() {
+        candidates.push(selector_candidate(
+            window_title,
+            Some(automation_id),
+            None,
+            None,
+            None,
+            SelectorConfidence::High,
+            90,
+            "Automation id is stable when the application provides it.",
+            Vec::new(),
+        ));
+    }
+    if !name.is_empty() && !control_type.is_empty() {
+        candidates.push(selector_candidate(
+            window_title,
+            None,
+            Some(name),
+            Some(control_type),
+            None,
+            SelectorConfidence::Medium,
+            70,
+            "Name plus control type is readable but can change with localization or content.",
+            vec!["Name selectors can change with UI text, localization, or user data.".to_string()],
+        ));
+    }
+    if !path.is_empty() {
+        candidates.push(selector_candidate(
+            window_title,
+            None,
+            None,
+            if control_type.is_empty() {
+                None
+            } else {
+                Some(control_type)
+            },
+            Some(path),
+            SelectorConfidence::Low,
+            45,
+            "Path can target elements without names or ids, but sibling insertions can shift it.",
+            vec![
+                "Path-only selectors are positional and should be treated as fragile.".to_string(),
+            ],
+        ));
+    }
+    candidates
+}
+
+fn selector_candidate(
+    window_title: &str,
+    id: Option<&str>,
+    name: Option<&str>,
+    control_type: Option<&str>,
+    path: Option<&[u32]>,
+    confidence: SelectorConfidence,
+    score: u8,
+    rationale: &str,
+    warnings: Vec<String>,
+) -> AccessibilitySelectorCandidate {
+    AccessibilitySelectorCandidate {
+        confidence,
+        score,
+        target: Target {
+            app_name: None,
+            process_name: None,
+            window_title: Some(window_title.to_string()),
+            title_contains: None,
+            url: None,
+            file_path: None,
+            accessibility: Some(cueflow_core::AccessibilityTarget {
+                id: id.map(str::to_string),
+                name: name.map(str::to_string),
+                control_type: control_type.map(str::to_string),
+                path: path.map(<[u32]>::to_vec),
+            }),
+            image: None,
+            coordinates: None,
+            platform_selectors: BTreeMap::new(),
+        },
+        rationale: rationale.to_string(),
+        warnings,
+    }
+}
+
+fn has_children(
+    element: &IUIAutomationElement,
+    condition: &IUIAutomationCondition,
+) -> Result<bool, AdapterError> {
+    let children = unsafe {
+        element
+            .FindAll(TreeScope_Children, condition)
+            .map_err(|_| AdapterError::new("Windows could not query accessibility children"))?
+    };
+    let count = unsafe {
+        children
+            .Length()
+            .map_err(|_| AdapterError::new("Windows could not count accessibility children"))?
+    };
+    Ok(count > 0)
+}
+
+fn current_bstr(
+    element: &IUIAutomationElement,
+    read: impl FnOnce(&IUIAutomationElement) -> windows::core::Result<BSTR>,
+) -> String {
+    read(element)
+        .map(|value| value.to_string())
+        .unwrap_or_default()
+}
+
+fn current_bool(
+    element: &IUIAutomationElement,
+    read: impl FnOnce(&IUIAutomationElement) -> windows::core::Result<BOOL>,
+) -> Option<bool> {
+    read(element).map(|value| value.as_bool()).ok()
+}
+
+fn current_bounds(element: &IUIAutomationElement) -> Option<AccessibilityBounds> {
+    let RECT {
+        left,
+        top,
+        right,
+        bottom,
+    } = unsafe { element.CurrentBoundingRectangle().ok()? };
+    Some(AccessibilityBounds {
+        left,
+        top,
+        right,
+        bottom,
+    })
+}
+
+fn current_value(element: &IUIAutomationElement, include_values: bool) -> Option<String> {
+    if !include_values
+        || current_bool(element, |element| unsafe { element.CurrentIsPassword() }) == Some(true)
+    {
+        return None;
+    }
+    let pattern = unsafe { element.GetCurrentPattern(UIA_ValuePatternId).ok()? };
+    let value_pattern: IUIAutomationValuePattern = pattern.cast().ok()?;
+    unsafe { value_pattern.CurrentValue().ok() }.map(|value| value.to_string())
+}
+
+fn current_actions(element: &IUIAutomationElement) -> Vec<String> {
+    let mut actions = Vec::new();
+    if unsafe { element.GetCurrentPattern(UIA_InvokePatternId) }.is_ok() {
+        actions.push("invoke".to_string());
+    }
+    if unsafe { element.GetCurrentPattern(UIA_ValuePatternId) }.is_ok() {
+        actions.push("setValue".to_string());
+    }
+    if unsafe { element.GetCurrentPattern(UIA_ScrollPatternId) }.is_ok() {
+        actions.push("scroll".to_string());
+    }
+    actions
+}
+
+struct SemanticMatch {
+    element: IUIAutomationElement,
+    summary: String,
 }
 
 fn with_semantic_target<T>(
@@ -787,33 +1696,80 @@ fn with_semantic_target<T>(
                 .CreateTrueCondition()
                 .map_err(|_| AdapterError::new("Windows could not create a UI Automation query"))?
         };
-        let elements = unsafe {
-            root.FindAll(TreeScope_Subtree, &condition)
-                .map_err(|_| AdapterError::new("Windows could not query the requested target"))?
-        };
-        let mut matching = Vec::new();
-        let count = unsafe {
-            elements
-                .Length()
-                .map_err(|_| AdapterError::new("Windows could not count UI Automation targets"))?
-        };
-        for index in 0..count {
-            let element = unsafe {
-                elements
-                    .GetElement(index)
-                    .map_err(|_| AdapterError::new("Windows could read a UI Automation target"))?
-            };
-            if accessibility_matches(&element, accessibility)? {
-                matching.push(element);
+        let (matching, inspected) = if let Some(path) = &accessibility.path {
+            let inspected = element_summary(&root, &[]).map(|summary| vec![summary])?;
+            match find_element_by_path(&root, &condition, path) {
+                Ok(element) if accessibility_matches(&element, accessibility, path)? => {
+                    let summary = element_summary(&element, path)?;
+                    (
+                        vec![SemanticMatch {
+                            element,
+                            summary: summary.clone(),
+                        }],
+                        [inspected, vec![summary]].concat(),
+                    )
+                }
+                Ok(element) => {
+                    let summary = element_summary(&element, path)?;
+                    (Vec::new(), [inspected, vec![summary]].concat())
+                }
+                Err(error) if is_target_absent(&error) => (Vec::new(), inspected),
+                Err(error) => return Err(error),
             }
-        }
+        } else {
+            let mut matching = Vec::new();
+            let mut inspected = Vec::new();
+            let mut remaining_nodes = SEMANTIC_SEARCH_MAX_NODES;
+            let mut truncated = false;
+            collect_semantic_matches(
+                &root,
+                &condition,
+                accessibility,
+                &[],
+                SEMANTIC_SEARCH_MAX_DEPTH,
+                &mut remaining_nodes,
+                &mut truncated,
+                &mut matching,
+                &mut inspected,
+            )?;
+            if truncated {
+                return Err(
+                    AdapterError::new("requested semantic target search was truncated")
+                        .with_source(format!(
+                            "failureKind=truncatedSearch; {}",
+                            semantic_search_diagnostics(target, accessibility, &[], &inspected)
+                        )),
+                );
+            }
+            (matching, inspected)
+        };
 
         match matching.as_slice() {
-            [] => Err(AdapterError::new("requested semantic target was not found")),
-            [element] => operation(element),
-            _ => Err(AdapterError::new(
-                "requested semantic target matched multiple elements",
-            )),
+            [] => Err(
+                AdapterError::new("requested semantic target was not found").with_source(format!(
+                    "failureKind=notFound; {}",
+                    semantic_search_diagnostics(target, accessibility, &[], &inspected)
+                )),
+            ),
+            [element] => operation(&element.element),
+            _ => {
+                let matched = matching
+                    .iter()
+                    .map(|matched| matched.summary.clone())
+                    .collect::<Vec<_>>();
+                Err(
+                    AdapterError::new("requested semantic target matched multiple elements")
+                        .with_source(format!(
+                            "failureKind=ambiguous; {}",
+                            semantic_search_diagnostics(
+                                target,
+                                accessibility,
+                                &matched,
+                                &inspected,
+                            )
+                        )),
+                )
+            }
         }
     })();
     if should_uninitialize {
@@ -822,6 +1778,103 @@ fn with_semantic_target<T>(
         }
     }
     result
+}
+
+fn find_element_by_path(
+    root: &IUIAutomationElement,
+    condition: &IUIAutomationCondition,
+    path: &[u32],
+) -> Result<IUIAutomationElement, AdapterError> {
+    let mut element = root.clone();
+    for index in path {
+        let child_elements = unsafe {
+            element
+                .FindAll(TreeScope_Children, condition)
+                .map_err(|_| AdapterError::new("Windows could not query UI Automation children"))?
+        };
+        let child_count = unsafe {
+            child_elements
+                .Length()
+                .map_err(|_| AdapterError::new("Windows could not count UI Automation children"))?
+        };
+        if *index >= child_count as u32 {
+            return Err(semantic_target_not_found());
+        }
+        element = unsafe {
+            child_elements
+                .GetElement(*index as i32)
+                .map_err(|_| semantic_target_not_found())?
+        };
+    }
+    Ok(element)
+}
+
+fn semantic_target_not_found() -> AdapterError {
+    AdapterError::new("requested semantic target was not found").with_source("failureKind=notFound")
+}
+
+fn collect_semantic_matches(
+    element: &IUIAutomationElement,
+    condition: &IUIAutomationCondition,
+    accessibility: &cueflow_core::AccessibilityTarget,
+    path: &[u32],
+    depth_remaining: u32,
+    remaining_nodes: &mut usize,
+    truncated: &mut bool,
+    matching: &mut Vec<SemanticMatch>,
+    inspected: &mut Vec<String>,
+) -> Result<(), AdapterError> {
+    if *remaining_nodes == 0 {
+        *truncated = true;
+        return Ok(());
+    }
+    *remaining_nodes -= 1;
+
+    let summary = element_summary(element, path)?;
+    if inspected.len() < 12 {
+        inspected.push(summary.clone());
+    }
+    if accessibility_matches(element, accessibility, path)? {
+        matching.push(SemanticMatch {
+            element: element.clone(),
+            summary,
+        });
+    }
+    if depth_remaining == 0 {
+        *truncated = true;
+        return Ok(());
+    }
+
+    let Ok(child_elements) = (unsafe { element.FindAll(TreeScope_Children, condition) }) else {
+        *truncated = true;
+        return Ok(());
+    };
+    let Ok(child_count) = (unsafe { child_elements.Length() }) else {
+        *truncated = true;
+        return Ok(());
+    };
+    for index in 0..child_count {
+        if *remaining_nodes == 0 {
+            *truncated = true;
+            break;
+        }
+        let Ok(child) = (unsafe { child_elements.GetElement(index) }) else {
+            *truncated = true;
+            continue;
+        };
+        collect_semantic_matches(
+            &child,
+            condition,
+            accessibility,
+            &[path, &[index as u32]].concat(),
+            depth_remaining - 1,
+            remaining_nodes,
+            truncated,
+            matching,
+            inspected,
+        )?;
+    }
+    Ok(())
 }
 
 fn find_semantic_window(target: &Target) -> Result<HWND, AdapterError> {
@@ -833,7 +1886,14 @@ fn find_semantic_window(target: &Target) -> Result<HWND, AdapterError> {
 fn accessibility_matches(
     element: &IUIAutomationElement,
     accessibility: &cueflow_core::AccessibilityTarget,
+    path: &[u32],
 ) -> Result<bool, AdapterError> {
+    if let Some(expected_path) = &accessibility.path
+        && expected_path != path
+    {
+        return Ok(false);
+    }
+
     if let Some(id) = &accessibility.id {
         let current_id = unsafe {
             element
@@ -877,21 +1937,28 @@ fn accessibility_matches(
 fn unsupported_action_reason(action: &Action, config: &RunConfig) -> Option<&'static str> {
     match action {
         Action::FocusWindow { target } => unsupported_window_target_reason(target),
+        Action::ClickTarget { target } if target.coordinates.is_some() => {
+            unsupported_coordinate_target_reason(target, config)
+        }
         Action::ClickTarget { target }
         | Action::TypeText {
             target: Some(target),
             ..
-        } => unsupported_semantic_target_reason(target),
-        Action::PressKey {
-            target: Some(_), ..
-        } => Some("targeted key chords are not yet supported by the Windows UI Automation adapter"),
+        }
+        | Action::PressKey {
+            target: Some(target),
+            ..
+        } => unsupported_semantic_target_reason_with_config(target, config),
         Action::Scroll {
             target: Some(target),
             ..
-        } => unsupported_semantic_target_reason(target),
+        } => unsupported_semantic_target_reason_with_config(target, config),
         Action::RunCommand { command, .. } => unsupported_command_reason(command, config),
         Action::WaitFor { condition } => unsupported_wait_reason(condition, config),
         Action::Assert { assertion } => match assertion {
+            Assertion::TargetExists { target } if target.accessibility.is_some() => {
+                unsupported_semantic_target_reason_with_config(target, config)
+            }
             Assertion::TargetExists { target } => unsupported_window_target_reason(target),
             Assertion::Condition { condition } => unsupported_wait_reason(condition, config),
         },
@@ -903,29 +1970,82 @@ fn unsupported_wait_reason(condition: &WaitCondition, config: &RunConfig) -> Opt
     match condition {
         WaitCondition::WindowExists { target } => {
             if target.accessibility.is_some() {
-                unsupported_semantic_target_reason(target)
+                unsupported_semantic_target_reason_with_config(target, config)
             } else {
                 unsupported_window_target_reason(target)
             }
         }
         WaitCondition::WindowFocused { target } if target.accessibility.is_some() => {
-            unsupported_semantic_target_reason(target)
+            unsupported_semantic_target_reason_with_config(target, config)
         }
         WaitCondition::WindowFocused { target } => unsupported_window_target_reason(target),
+        WaitCondition::TargetExists { target }
+        | WaitCondition::TargetFocused { target }
+        | WaitCondition::TargetEnabled { target }
+        | WaitCondition::TargetVisible { target }
+        | WaitCondition::TargetNotExists { target }
+        | WaitCondition::TargetNameContains { target, .. } => {
+            unsupported_semantic_target_reason_with_config(target, config)
+        }
+        WaitCondition::TargetValueContains { target, .. } => {
+            if !config.allow_value_capture {
+                Some("targetValueContains requires explicit allowValueCapture approval")
+            } else {
+                unsupported_semantic_target_reason_with_config(target, config)
+            }
+        }
         WaitCondition::ProcessRunning { target } => unsupported_process_target_reason(target),
         WaitCondition::CommandExits { command, .. } => unsupported_command_reason(command, config),
         _ => None,
     }
 }
 
-fn unsupported_semantic_target_reason(target: &Target) -> Option<&'static str> {
+fn unsupported_semantic_target_reason_with_config(
+    target: &Target,
+    config: &RunConfig,
+) -> Option<&'static str> {
     if target.accessibility.is_none() {
         return Some("semantic target operations require an accessibility selector");
+    }
+    if let Some(accessibility) = &target.accessibility
+        && accessibility.path.is_some()
+        && accessibility.id.is_none()
+        && accessibility.name.is_none()
+        && accessibility.control_type.is_none()
+        && !config.allow_path_only_selectors
+    {
+        return Some(
+            "path-only accessibility selectors require explicit allowPathOnlySelectors approval",
+        );
     }
 
     let mut window_target = target.clone();
     window_target.accessibility = None;
     unsupported_window_target_reason(&window_target)
+}
+
+fn unsupported_coordinate_target_reason(
+    target: &Target,
+    config: &RunConfig,
+) -> Option<&'static str> {
+    if !config.allow_coordinate_targets {
+        return Some("coordinate targets require explicit allowCoordinateTargets approval");
+    }
+    if target.app_name.is_some()
+        || target.process_name.is_some()
+        || target.window_title.is_some()
+        || target.title_contains.is_some()
+        || target.url.is_some()
+        || target.file_path.is_some()
+        || target.accessibility.is_some()
+        || target.image.is_some()
+        || !target.platform_selectors.is_empty()
+    {
+        return Some(
+            "Windows coordinate clicks currently support only absolute screen coordinates",
+        );
+    }
+    None
 }
 
 fn unsupported_window_target_reason(target: &Target) -> Option<&'static str> {
@@ -941,6 +2061,7 @@ fn unsupported_window_target_reason(target: &Target) -> Option<&'static str> {
             "Windows window queries currently support only a windowTitle or titleContains selector",
         );
     }
+
     if target.window_title.is_some() && target.title_contains.is_some() {
         return Some("Windows window queries require exactly one of windowTitle or titleContains");
     }
@@ -983,6 +2104,7 @@ mod tests {
         assert!(capabilities.supports_focus);
         assert!(capabilities.supports_input);
         assert!(capabilities.supports_semantic_targets);
+        assert!(capabilities.supports_coordinate_targets);
         assert!(capabilities.supports_process_queries);
     }
 
@@ -1000,6 +2122,7 @@ mod tests {
                 id: Some("submit".to_string()),
                 name: None,
                 control_type: None,
+                path: None,
             }),
             image: None,
             coordinates: None,
@@ -1038,6 +2161,7 @@ mod tests {
                 id: Some("submit".to_string()),
                 name: Some("Submit".to_string()),
                 control_type: Some("button".to_string()),
+                path: None,
             }),
             image: None,
             coordinates: None,
@@ -1058,12 +2182,172 @@ mod tests {
             adapter
                 .preflight(
                     &Action::WaitFor {
-                        condition: WaitCondition::WindowFocused { target },
+                        condition: WaitCondition::WindowFocused {
+                            target: target.clone(),
+                        },
                     },
                     &RunConfig::default(),
                 )
                 .len(),
             0
+        );
+        for condition in [
+            WaitCondition::TargetExists {
+                target: target.clone(),
+            },
+            WaitCondition::TargetFocused {
+                target: target.clone(),
+            },
+            WaitCondition::TargetEnabled {
+                target: target.clone(),
+            },
+            WaitCondition::TargetVisible {
+                target: target.clone(),
+            },
+            WaitCondition::TargetNameContains {
+                target: target.clone(),
+                text: "Ready".to_string(),
+            },
+            WaitCondition::TargetValueContains {
+                target,
+                text: "ready".to_string(),
+            },
+        ] {
+            let config = RunConfig {
+                allow_value_capture: true,
+                ..RunConfig::default()
+            };
+            assert!(
+                adapter
+                    .preflight(&Action::WaitFor { condition }, &config)
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_accepts_targeted_key_chords_for_scoped_accessibility_targets() {
+        let adapter = WindowsDesktopAdapter;
+        let target = Target {
+            app_name: None,
+            process_name: None,
+            window_title: Some("Settings".to_string()),
+            title_contains: None,
+            url: None,
+            file_path: None,
+            accessibility: Some(AccessibilityTarget {
+                id: Some("search".to_string()),
+                name: None,
+                control_type: Some("edit".to_string()),
+                path: None,
+            }),
+            image: None,
+            coordinates: None,
+            platform_selectors: BTreeMap::new(),
+        };
+
+        assert!(
+            adapter
+                .preflight(
+                    &Action::PressKey {
+                        keys: "Ctrl+A".to_string(),
+                        target: Some(target),
+                    },
+                    &RunConfig::default(),
+                )
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn preflight_accepts_coordinate_only_clicks_as_last_resort_targets() {
+        let adapter = WindowsDesktopAdapter;
+        let config = RunConfig {
+            allow_coordinate_targets: true,
+            ..RunConfig::default()
+        };
+        assert!(
+            adapter
+                .preflight(
+                    &Action::ClickTarget {
+                        target: Target {
+                            app_name: None,
+                            process_name: None,
+                            window_title: None,
+                            title_contains: None,
+                            url: None,
+                            file_path: None,
+                            accessibility: None,
+                            image: None,
+                            coordinates: Some(cueflow_core::Coordinates { x: 10, y: 20 }),
+                            platform_selectors: BTreeMap::new(),
+                        },
+                    },
+                    &config,
+                )
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_ambiguous_coordinate_clicks() {
+        let adapter = WindowsDesktopAdapter;
+        let config = RunConfig {
+            allow_coordinate_targets: true,
+            ..RunConfig::default()
+        };
+        let diagnostics = adapter.preflight(
+            &Action::ClickTarget {
+                target: Target {
+                    app_name: None,
+                    process_name: None,
+                    window_title: Some("Settings".to_string()),
+                    title_contains: None,
+                    url: None,
+                    file_path: None,
+                    accessibility: None,
+                    image: None,
+                    coordinates: Some(cueflow_core::Coordinates { x: 10, y: 20 }),
+                    platform_selectors: BTreeMap::new(),
+                },
+            },
+            &config,
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].message,
+            "Windows coordinate clicks currently support only absolute screen coordinates"
+        );
+    }
+
+    #[test]
+    fn preflight_rejects_targeted_key_chords_without_accessibility_scope() {
+        let adapter = WindowsDesktopAdapter;
+        let diagnostics = adapter.preflight(
+            &Action::PressKey {
+                keys: "Ctrl+A".to_string(),
+                target: Some(Target {
+                    app_name: None,
+                    process_name: None,
+                    window_title: Some("Settings".to_string()),
+                    title_contains: None,
+                    url: None,
+                    file_path: None,
+                    accessibility: None,
+                    image: None,
+                    coordinates: None,
+                    platform_selectors: BTreeMap::new(),
+                }),
+            },
+            &RunConfig::default(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "capability-unavailable");
+        assert_eq!(
+            diagnostics[0].message,
+            "semantic target operations require an accessibility selector"
         );
     }
 
@@ -1152,6 +2436,63 @@ mod tests {
                 .matches("New tab - Microsoft\u{200B} Edge")
         );
         assert!(!WindowTitleMatcher::Contains("Firefox").matches("Google - Microsoft Edge"));
+    }
+
+    #[test]
+    fn accessibility_paths_use_root_and_child_index_notation() {
+        assert_eq!(format_accessibility_path(&[]), "[]");
+        assert_eq!(format_accessibility_path(&[0, 12, 3]), "[0,12,3]");
+    }
+
+    #[test]
+    fn selector_candidates_prefer_stable_identifiers_before_paths() {
+        let candidates = selector_candidates("Demo", &[2, 1], "submitButton", "Submit", "button");
+
+        assert_eq!(candidates.len(), 4);
+        assert_eq!(candidates[0].confidence, SelectorConfidence::High);
+        assert_eq!(candidates[0].score, 95);
+        assert_eq!(
+            candidates[0]
+                .target
+                .accessibility
+                .as_ref()
+                .unwrap()
+                .id
+                .as_deref(),
+            Some("submitButton")
+        );
+        assert_eq!(candidates[2].confidence, SelectorConfidence::Medium);
+        assert_eq!(candidates[3].confidence, SelectorConfidence::Low);
+        assert_eq!(
+            candidates[3].target.accessibility.as_ref().unwrap().path,
+            Some(vec![2, 1])
+        );
+        assert_eq!(
+            candidates[3].warnings,
+            vec!["Path-only selectors are positional and should be treated as fragile."]
+        );
+    }
+
+    #[test]
+    fn write_bmp_emits_top_down_32bpp_bitmap() {
+        let path = std::env::temp_dir().join(format!(
+            "cueflow-write-bmp-{}-{}.bmp",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let pixels = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+
+        write_bmp(&path, 2, 1, &pixels).expect("bmp writes");
+        let bytes = fs::read(&path).expect("bmp can be read");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(&bytes[0..2], b"BM");
+        assert_eq!(u32::from_le_bytes(bytes[10..14].try_into().unwrap()), 54);
+        assert_eq!(u32::from_le_bytes(bytes[14..18].try_into().unwrap()), 40);
+        assert_eq!(i32::from_le_bytes(bytes[18..22].try_into().unwrap()), 2);
+        assert_eq!(i32::from_le_bytes(bytes[22..26].try_into().unwrap()), -1);
+        assert_eq!(u16::from_le_bytes(bytes[28..30].try_into().unwrap()), 32);
+        assert_eq!(&bytes[54..], &pixels);
     }
 
     #[test]
