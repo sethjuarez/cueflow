@@ -39,6 +39,8 @@ Cueflow is layered so portable workflow definitions remain independent from plat
 5. `cueflow-tauri`
    - Represents a thin app bridge for frontend editors that submit run requests.
    - Frontend apps should edit definitions and request runs; they should not execute automations directly.
+   - Host-facing automation must enter through `AutomationExecutor` with an explicit `RunConfig`; app/bridge code must not call adapter methods directly unless the adapter method itself enforces the same policy gates before side effects.
+   - Host bridges must preserve the executor ordering: validate, preflight, then execute. Any evidence pruning or cleanup belongs after successful preflight and before execution, never before policy checks.
 
 ## Execution flow
 
@@ -64,6 +66,7 @@ flowchart LR
 - Accessibility tree inspection is read-only, bounded by depth and node count, omits element values by default, and should feed authoring/agent planning rather than become an opaque replay artifact. Accessibility node paths can be reused as stable-enough selectors when names or automation ids are absent, but selectors still fail closed on typed failure kinds for no-match, ambiguity, disabled/offscreen/actionability problems, focus denial, or truncated semantic search. Node geometry includes computed click points when bounds are usable so diagnostics can explain pointer fallbacks without making coordinates primary.
 - Selector repair consumes a fresh bounded accessibility tree and produces candidate selectors with confidence/warnings. Repair suggestions are evidence for a host or authoring layer; they should not silently mutate definitions without policy.
 - Host policy controls gate fragile or sensitive behavior. Coordinate targets, path-only selectors, runtime value reads, screenshot evidence, image targets, and full-desktop screenshots require explicit run approval. Read-only accessibility inspection has a separate `--include-values` opt-in for controlled surfaces.
+- The safe host gateway is the executor path. CLI and Tauri hosts may add UX-specific wrapping, evidence persistence, or event forwarding, but policy decisions must remain equivalent to executor preflight and adapter execution-time guards.
 - Accessibility paths are generated from Windows UI Automation child indexes. `[]` targets the resolved window root; non-empty paths target descendants and should be paired with semantic facts such as control type whenever possible.
 - Output video, screenshots, accessibility trees, and logs are artifacts, not the automation definition itself. Step evidence should prefer target-scoped accessibility trees and window-scoped screenshots; full-desktop capture is a last-resort privacy-sensitive artifact. Evidence retention must stay local by default, include manifest/summary metadata, enforce bounded artifact sizes, and support explicit pruning of Cueflow-generated evidence before a fresh run.
 - Live drill manifests are the regression boundary for native automation behavior. Drills should include expected-success and expected-failure cases so timeout, ambiguity, and policy behavior stay deliberate.

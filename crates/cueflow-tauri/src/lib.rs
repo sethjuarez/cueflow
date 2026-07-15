@@ -45,7 +45,9 @@ pub fn run_automation<S: RunEventSink>(
 
 #[cfg(test)]
 mod tests {
-    use cueflow_core::{Action, CURRENT_SCHEMA_VERSION, RunConfig, RunEvent, Step};
+    use cueflow_core::{
+        Action, CURRENT_SCHEMA_VERSION, ImageTarget, RunConfig, RunEvent, Step, Target,
+    };
     use cueflow_executor::{RunEventSink, RunOutcome};
 
     use super::*;
@@ -101,5 +103,66 @@ mod tests {
 
         assert_eq!(report.outcome, RunOutcome::Succeeded);
         assert_eq!(sink.0, report.events);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn bridge_rejects_policy_denied_targets_before_emitting_events() {
+        let request = RunAutomationRequest {
+            automation: AutomationDefinition {
+                id: "policy-denied".to_string(),
+                title: "Policy denied".to_string(),
+                description: None,
+                schema_version: CURRENT_SCHEMA_VERSION,
+                version: None,
+                variables: Default::default(),
+                metadata: Default::default(),
+                steps: vec![Step {
+                    id: "launch".to_string(),
+                    label: None,
+                    action: Action::LaunchUrl {
+                        url: "cueflow-test-do-not-open:".to_string(),
+                        target: Some(Target {
+                            app_name: None,
+                            process_name: None,
+                            window_title: Some("Cueflow Impossible Window".to_string()),
+                            title_contains: None,
+                            url: None,
+                            file_path: None,
+                            accessibility: None,
+                            image: Some(ImageTarget {
+                                path: "fixtures/impossible.bmp".to_string(),
+                                confidence: None,
+                                region: None,
+                            }),
+                            coordinates: None,
+                            platform_selectors: Default::default(),
+                        }),
+                    },
+                    timeout: None,
+                    retry: Default::default(),
+                    on_error: Default::default(),
+                    conditions: Vec::new(),
+                    platform_overrides: Vec::new(),
+                }],
+            },
+        };
+        let control = RunControl::default();
+        let mut sink = CollectingSink::default();
+        let config = RunConfig {
+            dry_run: false,
+            ..RunConfig::default()
+        };
+
+        let error = run_automation(request, config, &control, &mut sink)
+            .expect_err("policy-denied target fails in preflight");
+
+        assert!(matches!(error, ExecutorError::Preflight(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("image targets require explicit allowImageTargets approval")
+        );
+        assert!(sink.0.is_empty());
     }
 }
