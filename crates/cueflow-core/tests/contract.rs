@@ -24,6 +24,25 @@ const WINDOWS_PATH_ONLY_POLICY_DRILL: &str =
 const WINDOWS_COORDINATE_POLICY_DRILL: &str =
     include_str!("../../../examples/windows-coordinate-policy-drill.json");
 const WINDOWS_DRILL_MANIFEST: &str = include_str!("../../../examples/windows-drill-manifest.json");
+const MACOS_ACTIONABILITY_READINESS_DRILL: &str =
+    include_str!("../../../examples/macos-actionability-readiness-drill.json");
+const MACOS_MISSING_WINDOW_TIMEOUT_DRILL: &str =
+    include_str!("../../../examples/macos-missing-window-timeout-drill.json");
+const MACOS_IMAGE_TARGET_POLICY_DRILL: &str =
+    include_str!("../../../examples/macos-image-target-policy-drill.json");
+const MACOS_PATH_ONLY_POLICY_DRILL: &str =
+    include_str!("../../../examples/macos-path-only-policy-drill.json");
+const MACOS_COORDINATE_POLICY_DRILL: &str =
+    include_str!("../../../examples/macos-coordinate-policy-drill.json");
+const MACOS_EVIDENCE_SIZE_DRILL: &str =
+    include_str!("../../../examples/macos-evidence-size-drill.json");
+const MACOS_ACCESSIBILITY_PERMISSION_DRILL: &str =
+    include_str!("../../../examples/macos-accessibility-permission-drill.json");
+const MACOS_DRILL_MANIFEST: &str = include_str!("../../../examples/macos-drill-manifest.json");
+const MACOS_SEMANTIC_ACTIONABILITY_DRILL: &str =
+    include_str!("../../../examples/macos-semantic-actionability-drill.json");
+const MACOS_SEMANTIC_DRILL_MANIFEST: &str =
+    include_str!("../../../examples/macos-semantic-drill-manifest.json");
 
 #[test]
 fn v1_fixture_is_a_stable_json_round_trip() {
@@ -226,6 +245,72 @@ fn windows_drill_manifest_remains_well_formed() {
             .expect("drills is an array")
             .len()
             >= 2
+    );
+}
+
+#[test]
+fn macos_drill_fixtures_remain_valid_definitions() {
+    for (fixture, expected_id) in [
+        (
+            MACOS_ACTIONABILITY_READINESS_DRILL,
+            "macos-actionability-readiness-drill",
+        ),
+        (
+            MACOS_MISSING_WINDOW_TIMEOUT_DRILL,
+            "macos-missing-window-timeout-drill",
+        ),
+        (
+            MACOS_IMAGE_TARGET_POLICY_DRILL,
+            "macos-image-target-policy-drill",
+        ),
+        (MACOS_PATH_ONLY_POLICY_DRILL, "macos-path-only-policy-drill"),
+        (
+            MACOS_COORDINATE_POLICY_DRILL,
+            "macos-coordinate-policy-drill",
+        ),
+        (MACOS_EVIDENCE_SIZE_DRILL, "macos-evidence-size-drill"),
+        (
+            MACOS_ACCESSIBILITY_PERMISSION_DRILL,
+            "macos-accessibility-permission-drill",
+        ),
+        (
+            MACOS_SEMANTIC_ACTIONABILITY_DRILL,
+            "macos-semantic-actionability-drill",
+        ),
+    ] {
+        let definition = parse_definition_json(fixture).expect("macOS drill parses");
+
+        assert_eq!(definition.id, expected_id);
+    }
+}
+
+#[test]
+fn macos_drill_manifest_remains_well_formed() {
+    let manifest: Value =
+        serde_json::from_str(MACOS_DRILL_MANIFEST).expect("drill manifest is JSON");
+
+    assert_eq!(manifest["id"], "macos-foundation-drills");
+    assert!(
+        manifest["drills"]
+            .as_array()
+            .expect("drills is an array")
+            .len()
+            >= 7
+    );
+}
+
+#[test]
+fn macos_semantic_drill_manifest_remains_well_formed() {
+    let manifest: Value =
+        serde_json::from_str(MACOS_SEMANTIC_DRILL_MANIFEST).expect("drill manifest is JSON");
+
+    assert_eq!(manifest["id"], "macos-semantic-foundation-drills");
+    assert!(
+        manifest["drills"]
+            .as_array()
+            .expect("drills is an array")
+            .len()
+            >= 1
     );
 }
 

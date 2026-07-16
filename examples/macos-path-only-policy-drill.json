@@ -1,0 +1,17 @@
+{
+  "id": "macos-path-only-policy-drill",
+  "title": "macOS path-only selector policy drill",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "click-path-only-target",
+      "kind": "clickTarget",
+      "target": {
+        "appName": "TextEdit",
+        "accessibility": {
+          "path": [0]
+        }
+      }
+    }
+  ]
+}

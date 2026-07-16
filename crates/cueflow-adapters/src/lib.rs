@@ -132,15 +132,32 @@ impl CurrentPlatformAdapter {
     pub fn new() -> Self {
         Self
     }
+
+    pub fn request_accessibility_permission() -> bool {
+        true
+    }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+mod macos;
+
+#[cfg(target_os = "macos")]
+pub use macos::MacOsDesktopAdapter as CurrentPlatformAdapter;
+
+#[cfg(target_os = "macos")]
+impl CurrentPlatformAdapter {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 #[derive(Debug, Default)]
 pub struct CurrentPlatformAdapter {
     noop: NoopDesktopAdapter,
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 impl CurrentPlatformAdapter {
     pub fn new() -> Self {
         Self::default()
@@ -158,6 +175,10 @@ impl CurrentPlatformAdapter {
             supports_process_queries: false,
             supports_accessibility_tree: false,
         }
+    }
+
+    pub fn request_accessibility_permission() -> bool {
+        false
     }
 
     pub fn inspect_window(
@@ -212,7 +233,7 @@ impl CurrentPlatformAdapter {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 impl ExecutionAdapter for CurrentPlatformAdapter {
     fn execute(
         &mut self,

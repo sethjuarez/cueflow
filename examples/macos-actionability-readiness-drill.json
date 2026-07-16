@@ -1,0 +1,44 @@
+{
+  "id": "macos-actionability-readiness-drill",
+  "title": "macOS TextEdit readiness drill",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "open-textedit",
+      "kind": "launchApp",
+      "app": "TextEdit",
+      "target": {
+        "appName": "TextEdit"
+      },
+      "timeout": {
+        "millis": 5000
+      }
+    },
+    {
+      "id": "wait-for-textedit-window",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "windowExists",
+        "target": {
+          "appName": "TextEdit"
+        }
+      },
+      "timeout": {
+        "millis": 5000
+      }
+    },
+    {
+      "id": "assert-textedit-window",
+      "kind": "assert",
+      "assertion": {
+        "kind": "condition",
+        "condition": {
+          "kind": "windowExists",
+          "target": {
+            "appName": "TextEdit"
+          }
+        }
+      }
+    }
+  ]
+}

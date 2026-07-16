@@ -1,0 +1,14 @@
+{
+  "id": "macos-semantic-foundation-drills",
+  "evidenceDir": "../target/cueflow-macos-semantic-drill-evidence",
+  "drills": [
+    {
+      "id": "semantic-actionability",
+      "path": "macos-semantic-actionability-drill.json",
+      "expectedOutcome": "succeeded",
+      "policyProfile": "evidence",
+      "repeat": 2,
+      "expectedMaxDurationMillis": 15000
+    }
+  ]
+}

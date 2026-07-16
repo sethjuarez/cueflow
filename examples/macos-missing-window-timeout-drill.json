@@ -1,0 +1,20 @@
+{
+  "id": "macos-missing-window-timeout-drill",
+  "title": "macOS missing window timeout drill",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "wait-for-missing-window",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "windowExists",
+        "target": {
+          "windowTitle": "Cueflow Missing Window Drill Sentinel"
+        }
+      },
+      "timeout": {
+        "millis": 250
+      }
+    }
+  ]
+}

@@ -149,6 +149,23 @@ The macOS pass is complete when:
 - `cargo test --workspace` passes.
 - A final rubber-duck review finds no blocking foundational runtime gaps, excluding recorder/visual authoring.
 
+## Current validation status
+
+The macOS adapter implementation now covers the Windows adapter contract surfaces behind the same executor path: native launch/window/process/input/screenshot APIs, AXUIElement semantic inspection/actions/readiness checks, evidence, selector repair, command policy, coordinate policy, value-capture policy, and bounded image fallback behind image + screenshot approvals.
+
+Validated in this environment:
+
+- `cargo test --workspace`.
+- `examples/macos-drill-manifest.json` for launch/window readiness, timeout taxonomy, path-only/coordinate/image policy denial, evidence, and Accessibility-permission diagnostics.
+- Adapter unit tests for approved image preflight, bounded template matching, coordinate/path-only policy, process selector rejection, and capability shape.
+- `examples/macos-semantic-drill-manifest.json` after granting Accessibility permission, validating live AX semantic actionability success twice.
+
+Still not live-validated in this environment:
+
+- Windows live runtime behavior and Windows drill execution, because this is not a Windows host.
+
+Before claiming fully validated cross-platform parity, run the Windows tests and `examples/windows-drill-manifest.json` on a Windows host. From macOS, the available Windows-side signal is cross-target compilation, not live runtime validation.
+
 ## Notes for future implementers
 
 - Prefer semantic AX operations over synthesized input whenever possible.

@@ -1,0 +1,35 @@
+{
+  "id": "macos-semantic-actionability-drill",
+  "title": "macOS semantic actionability drill",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "open-textedit",
+      "kind": "launchApp",
+      "app": "TextEdit",
+      "target": {
+        "appName": "TextEdit"
+      },
+      "timeout": {
+        "millis": 5000
+      }
+    },
+    {
+      "id": "wait-for-window-root-actionable",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "targetActionable",
+        "target": {
+          "appName": "TextEdit",
+          "accessibility": {
+            "path": [],
+            "controlType": "AXWindow"
+          }
+        }
+      },
+      "timeout": {
+        "millis": 5000
+      }
+    }
+  ]
+}

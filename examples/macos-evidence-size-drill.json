@@ -1,0 +1,20 @@
+{
+  "id": "macos-evidence-size-drill",
+  "title": "macOS evidence size policy drill",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "inspect-textedit-evidence",
+      "kind": "assert",
+      "assertion": {
+        "kind": "condition",
+        "condition": {
+          "kind": "windowExists",
+          "target": {
+            "appName": "TextEdit"
+          }
+        }
+      }
+    }
+  ]
+}

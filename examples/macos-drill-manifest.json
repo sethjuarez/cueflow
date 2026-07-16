@@ -1,0 +1,50 @@
+{
+  "id": "macos-foundation-drills",
+  "evidenceDir": "../target/cueflow-macos-drill-evidence",
+  "drills": [
+    {
+      "id": "textedit-actionability",
+      "path": "macos-actionability-readiness-drill.json",
+      "expectedOutcome": "succeeded",
+      "repeat": 2,
+      "expectedMaxDurationMillis": 15000
+    },
+    {
+      "id": "missing-window-timeout",
+      "path": "macos-missing-window-timeout-drill.json",
+      "expectedOutcome": "failed",
+      "expectedFailureKind": "timeout",
+      "expectedMaxDurationMillis": 5000
+    },
+    {
+      "id": "path-only-policy",
+      "path": "macos-path-only-policy-drill.json",
+      "expectedOutcome": "executorError",
+      "expectedErrorContains": "allowPathOnlySelectors"
+    },
+    {
+      "id": "coordinate-policy",
+      "path": "macos-coordinate-policy-drill.json",
+      "expectedOutcome": "executorError",
+      "expectedErrorContains": "allowCoordinateTargets"
+    },
+    {
+      "id": "image-target-policy",
+      "path": "macos-image-target-policy-drill.json",
+      "expectedOutcome": "executorError",
+      "expectedErrorContains": "allowImageTargets"
+    },
+    {
+      "id": "evidence-size-policy",
+      "path": "macos-evidence-size-drill.json",
+      "expectedOutcome": "succeeded",
+      "policyProfile": "evidence",
+      "expectedMaxDurationMillis": 15000
+    },
+    {
+      "id": "accessibility-semantic-readiness",
+      "path": "macos-accessibility-permission-drill.json",
+      "expectedOutcome": "succeeded"
+    }
+  ]
+}

@@ -10,7 +10,7 @@ The core primitive is an intentional automation workflow: a reusable definition 
 | --- | --- |
 | `cueflow-core` | OS-agnostic automation schema, validation, serialization, run state, errors, artifacts, and portability analysis. |
 | `cueflow-executor` | Run orchestration, dry-run/no-op execution, retry/stop policy handling, run events, and structured tracing fields. |
-| `cueflow-adapters` | Platform adapter boundary plus a no-op/current-platform stub. Real Windows, macOS, and Linux adapters are follow-up work. |
+| `cueflow-adapters` | Platform adapter boundary plus current-platform adapters. Windows and macOS have native execution adapters; Linux currently retains no-op/unsupported behavior. |
 | `cueflow-recorder` | Optional capture-to-DSL surface. It intentionally emits `AutomationDefinition` rather than a separate macro format. |
 | `cueflow-tauri` | Optional host bridge that executes automation requests with run control and structured event forwarding. |
 
@@ -88,6 +88,8 @@ The Windows accessibility snapshot captures a bounded UI Automation tree for a u
 
 Windows also supports `processRunning` for an exact `processName` selector (for example, `msedge.exe`). Other target fields are rejected for process checks until process-path and application-identity matching are implemented.
 
+macOS uses native `open`, CoreGraphics window enumeration/input/screenshot APIs, and AXUIElement accessibility inspection/actions behind the same executor and policy contract. macOS window focus and semantic automation require the host process to have Accessibility permission; when permission is missing, semantic capabilities report unavailable and preflight fails before side effects. The macOS adapter supports app/URL/file launch, exact/contains window matching, focus with frontmost verification, process checks by `processName` or `appName`, bounded/redacted accessibility trees, semantic invoke/value/focus/scroll/readiness operations, last-resort coordinate clicks, policy-gated window screenshots, and bounded image-target fallback after both image and screenshot approvals. Use `request-accessibility-permission` to trigger the system prompt, then rerun `capabilities` and the macOS semantic drill manifest.
+
 ## Confidence
 
 Windows execution confidence is currently 8/10; overall project confidence is 7/10. The workspace test suite passes, and the Edge-to-Google workflow has completed successfully on Windows after platform selection, condition gating, and platform selector resolution were covered by regression tests.
@@ -96,7 +98,7 @@ The remaining risk is execution breadth rather than a known correctness failure:
 
 ## Development status
 
-Cueflow is in active development. Windows is the first supported execution target, with fail-closed window selection, scoped UI Automation actions, process readiness checks, and host-approved command execution. macOS and Linux retain the same portable contract but currently reject real execution. Native recording, macOS Accessibility support, and broader live application coverage remain planned work.
+Cueflow is in active development. Windows is the first supported execution target, with fail-closed window selection, scoped UI Automation actions, process readiness checks, and host-approved command execution. macOS now has a native adapter behind the same portable contract, including Accessibility-gated semantic automation and policy-gated visual fallback. Linux retains the same portable contract but currently rejects real execution. Native recording and broader live application coverage remain planned work.
 
 ## Development
 
@@ -108,6 +110,7 @@ The CLI exposes the agent-safe host surface:
 
 ```powershell
 cargo run -p cueflow-cli -- capabilities
+cargo run -p cueflow-cli -- request-accessibility-permission
 cargo run -p cueflow-cli -- inspect-window --title-contains Google --max-depth 3 --max-nodes 150
 cargo run -p cueflow-cli -- inspect-window --title-contains Google --output .\accessibility-tree.json
 cargo run -p cueflow-cli -- repair-selector --title-contains Google --control-type button
@@ -116,6 +119,8 @@ cargo run -p cueflow-cli -- screenshot --allow-desktop-screenshot --output .\scr
 cargo run -p cueflow-cli -- preflight examples\edge-demo-ready.json
 cargo run -p cueflow-cli -- run --evidence-dir .\evidence --capture-step-evidence --prune-evidence-before-run examples\edge-demo-ready.json
 cargo run -p cueflow-cli -- run-drills examples\windows-drill-manifest.json
+cargo run -p cueflow-cli -- run-drills examples/macos-drill-manifest.json
+cargo run -p cueflow-cli -- run-drills examples/macos-semantic-drill-manifest.json
 ```
 
 `capabilities`, `inspect-window`, `repair-selector`, `screenshot`, `run-drills`, and `preflight` emit JSON. `inspect-window --output` writes a privacy-preserving accessibility snapshot artifact and emits its `accessibilityTree` artifact reference. Accessibility nodes include bounds and computed `clickPoint` metadata when UI Automation exposes usable geometry, so actionability evidence can explain where a pointer fallback would land without taking the fallback path. Window-scoped `screenshot --window-title/--title-contains --output` captures a BMP artifact for the resolved window; full-desktop capture requires `--allow-desktop-screenshot`. `dry-run` and `run` emit JSONL `RunEvent` values; `--evidence-dir` persists `events.jsonl` and `summary.json`, and `--capture-step-evidence` adds target-scoped before/after/failure accessibility artifacts when a step has a window target. Add `--allow-screenshot-capture` to include window screenshots in step evidence. Evidence artifacts are bounded by a 25 MB default per-artifact cap; override with `--evidence-max-artifact-bytes`. Use `--prune-evidence-before-run` to remove only Cueflow-generated `events.jsonl`, `summary.json`, and `steps\` evidence in the target evidence directory before writing a fresh run bundle.

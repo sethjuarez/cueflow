@@ -1,0 +1,17 @@
+{
+  "id": "macos-image-target-policy-drill",
+  "title": "macOS image target policy drill",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "click-image-target",
+      "kind": "clickTarget",
+      "target": {
+        "appName": "TextEdit",
+        "image": {
+          "path": "examples/missing-image-target.bmp"
+        }
+      }
+    }
+  ]
+}

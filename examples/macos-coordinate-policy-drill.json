@@ -1,0 +1,17 @@
+{
+  "id": "macos-coordinate-policy-drill",
+  "title": "macOS coordinate target policy drill",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "click-coordinate-target",
+      "kind": "clickTarget",
+      "target": {
+        "coordinates": {
+          "x": 10,
+          "y": 10
+        }
+      }
+    }
+  ]
+}

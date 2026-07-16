@@ -27,9 +27,10 @@ Cueflow is layered so portable workflow definitions remain independent from plat
 
 3. `cueflow-adapters`
    - Defines the platform boundary for launch, focus, input, window, process, and read-only accessibility inspection operations.
-   - Ships a Windows-first module behind `cfg(windows)` for native shell launch with post-launch window correlation, exact-title window focus/query, window identity diagnostics, `SendInput` text/key/scroll injection, targeted UI Automation key focus/readiness checks, bounded path-bearing UI Automation tree capture, selector candidate/repair generation, window-scoped screenshot capture, last-resort absolute coordinate clicks, and file existence checks.
+   - Ships a Windows module behind `cfg(windows)` for native shell launch with post-launch window correlation, exact-title window focus/query, window identity diagnostics, `SendInput` text/key/scroll injection, targeted UI Automation key focus/readiness checks, bounded path-bearing UI Automation tree capture, selector candidate/repair generation, window-scoped screenshot capture, last-resort absolute coordinate clicks, and file existence checks.
+   - Ships a macOS module behind `cfg(target_os = "macos")` for native launch/window/process/input/screenshot APIs plus AXUIElement-gated semantic inspection, actions, readiness checks, evidence, selector repair, and bounded policy-gated image fallback.
    - Rejects unsupported selector shapes and UI Automation-dependent actions during preflight instead of silently ignoring constraints.
-   - Retains no-op/non-Windows adapters while macOS and Linux implementations are added behind the same portable contract.
+   - Retains no-op/non-Windows/non-macOS adapters while remaining platform implementations are added behind the same portable contract.
 
 4. `cueflow-recorder`
    - Represents optional capture/authoring.

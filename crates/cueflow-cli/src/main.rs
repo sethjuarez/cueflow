@@ -55,6 +55,25 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    if command == "request-accessibility-permission" {
+        if args.next().is_some() {
+            return usage();
+        }
+        let trusted = CurrentPlatformAdapter::request_accessibility_permission();
+        println!(
+            "{}",
+            serde_json::json!({
+                "platform": current_platform(),
+                "accessibilityTrusted": trusted,
+            })
+        );
+        return if trusted {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+
     if command == "inspect-window" {
         let Some((target, max_depth, max_nodes, include_values, output)) =
             parse_inspect_window_args(args)
@@ -305,7 +324,7 @@ fn main() -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: cueflow capabilities | cueflow inspect-window (--title-contains <text>|--window-title <text>) [--max-depth <n>] [--max-nodes <n>] [--include-values] [--output <path>] | cueflow repair-selector (--title-contains <text>|--window-title <text>) [--id <id>] [--name <name>] [--control-type <type>] [--path <indexes>] [--max-depth <n>] [--max-nodes <n>] | cueflow screenshot --output <path> [(--window-title <text>|--title-contains <text>)|--allow-desktop-screenshot] | cueflow run-drills <manifest.json> | cueflow <validate|preflight|dry-run|run> [--policy-profile <strict|evidence|visual-fallback|unsafe-lab>] [--evidence-dir <dir>] [--capture-step-evidence] [--evidence-max-artifact-bytes <bytes>] [--prune-evidence-before-run] [--allow-coordinate-targets] [--allow-path-only-selectors] [--allow-value-capture] [--allow-screenshot-capture] [--allow-image-targets] <automation.json>"
+        "usage: cueflow capabilities | cueflow request-accessibility-permission | cueflow inspect-window (--title-contains <text>|--window-title <text>) [--max-depth <n>] [--max-nodes <n>] [--include-values] [--output <path>] | cueflow repair-selector (--title-contains <text>|--window-title <text>) [--id <id>] [--name <name>] [--control-type <type>] [--path <indexes>] [--max-depth <n>] [--max-nodes <n>] | cueflow screenshot --output <path> [(--window-title <text>|--title-contains <text>)|--allow-desktop-screenshot] | cueflow run-drills <manifest.json> | cueflow <validate|preflight|dry-run|run> [--policy-profile <strict|evidence|visual-fallback|unsafe-lab>] [--evidence-dir <dir>] [--capture-step-evidence] [--evidence-max-artifact-bytes <bytes>] [--prune-evidence-before-run] [--allow-coordinate-targets] [--allow-path-only-selectors] [--allow-value-capture] [--allow-screenshot-capture] [--allow-image-targets] <automation.json>"
     );
     ExitCode::from(2)
 }
