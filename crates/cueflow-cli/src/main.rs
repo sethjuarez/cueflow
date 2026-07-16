@@ -193,15 +193,9 @@ fn main() -> ExitCode {
     let mut sink = JsonlSink;
     let control = RunControl::default();
     let clock = SystemClock::default();
-    let config = RunConfig {
+    let mut config = RunConfig {
         dry_run: command == "dry-run",
         platform: Some(current_platform()),
-        allow_coordinate_targets: options.allow_coordinate_targets,
-        allow_path_only_selectors: options.allow_path_only_selectors,
-        allow_value_capture: options.allow_value_capture,
-        capture_step_evidence: options.capture_step_evidence,
-        allow_screenshot_capture: options.allow_screenshot_capture,
-        allow_image_targets: options.allow_image_targets,
         evidence_max_artifact_bytes: options.evidence_max_artifact_bytes,
         evidence_directory: options
             .evidence_dir
@@ -209,6 +203,15 @@ fn main() -> ExitCode {
             .map(|path| path.display().to_string()),
         ..RunConfig::default()
     };
+    if let Some(profile) = options.policy_profile {
+        profile.apply_to(&mut config);
+    }
+    config.allow_coordinate_targets |= options.allow_coordinate_targets;
+    config.allow_path_only_selectors |= options.allow_path_only_selectors;
+    config.allow_value_capture |= options.allow_value_capture;
+    config.capture_step_evidence |= options.capture_step_evidence;
+    config.allow_screenshot_capture |= options.allow_screenshot_capture;
+    config.allow_image_targets |= options.allow_image_targets;
 
     if command == "preflight" {
         match executor.preflight(&definition, &config, &adapter) {
@@ -302,7 +305,7 @@ fn main() -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: cueflow capabilities | cueflow inspect-window (--title-contains <text>|--window-title <text>) [--max-depth <n>] [--max-nodes <n>] [--include-values] [--output <path>] | cueflow repair-selector (--title-contains <text>|--window-title <text>) [--id <id>] [--name <name>] [--control-type <type>] [--path <indexes>] [--max-depth <n>] [--max-nodes <n>] | cueflow screenshot --output <path> [(--window-title <text>|--title-contains <text>)|--allow-desktop-screenshot] | cueflow run-drills <manifest.json> | cueflow <validate|preflight|dry-run|run> [--evidence-dir <dir>] [--capture-step-evidence] [--evidence-max-artifact-bytes <bytes>] [--prune-evidence-before-run] [--allow-coordinate-targets] [--allow-path-only-selectors] [--allow-value-capture] [--allow-screenshot-capture] [--allow-image-targets] <automation.json>"
+        "usage: cueflow capabilities | cueflow inspect-window (--title-contains <text>|--window-title <text>) [--max-depth <n>] [--max-nodes <n>] [--include-values] [--output <path>] | cueflow repair-selector (--title-contains <text>|--window-title <text>) [--id <id>] [--name <name>] [--control-type <type>] [--path <indexes>] [--max-depth <n>] [--max-nodes <n>] | cueflow screenshot --output <path> [(--window-title <text>|--title-contains <text>)|--allow-desktop-screenshot] | cueflow run-drills <manifest.json> | cueflow <validate|preflight|dry-run|run> [--policy-profile <strict|evidence|visual-fallback|unsafe-lab>] [--evidence-dir <dir>] [--capture-step-evidence] [--evidence-max-artifact-bytes <bytes>] [--prune-evidence-before-run] [--allow-coordinate-targets] [--allow-path-only-selectors] [--allow-value-capture] [--allow-screenshot-capture] [--allow-image-targets] <automation.json>"
     );
     ExitCode::from(2)
 }
@@ -360,6 +363,11 @@ fn parse_automation_args(
             "--evidence-dir" if command == "run" || command == "dry-run" => {
                 evidence_dir = Some(PathBuf::from(args.next()?));
             }
+            "--policy-profile"
+                if command == "run" || command == "dry-run" || command == "preflight" =>
+            {
+                options.policy_profile = Some(AutomationPolicyProfile::from_cli(&args.next()?)?);
+            }
             "--allow-coordinate-targets" => options.allow_coordinate_targets = true,
             "--allow-path-only-selectors" => options.allow_path_only_selectors = true,
             "--allow-value-capture" => options.allow_value_capture = true,
@@ -385,6 +393,7 @@ fn parse_automation_args(
 struct AutomationCliOptions {
     path: String,
     evidence_dir: Option<PathBuf>,
+    policy_profile: Option<AutomationPolicyProfile>,
     allow_coordinate_targets: bool,
     allow_path_only_selectors: bool,
     allow_value_capture: bool,
@@ -411,6 +420,8 @@ struct DrillEntry {
     path: PathBuf,
     expected_outcome: DrillExpectedOutcome,
     #[serde(default)]
+    policy_profile: Option<AutomationPolicyProfile>,
+    #[serde(default)]
     allow_coordinate_targets: bool,
     #[serde(default)]
     allow_path_only_selectors: bool,
@@ -432,6 +443,8 @@ struct DrillEntry {
     expected_error_contains: Option<String>,
     #[serde(default)]
     expected_log_contains: Option<String>,
+    #[serde(default)]
+    expected_max_duration_millis: Option<u64>,
     #[serde(default)]
     repeat: Option<u32>,
 }
@@ -520,37 +533,45 @@ fn run_drill_manifest(manifest_path: PathBuf) -> ExitCode {
                     base
                 }
             });
-            let config = RunConfig {
+            let mut config = RunConfig {
                 dry_run: false,
                 platform: Some(current_platform()),
-                allow_coordinate_targets: drill.allow_coordinate_targets,
-                allow_path_only_selectors: drill.allow_path_only_selectors,
-                allow_value_capture: drill.allow_value_capture,
-                capture_step_evidence: drill.capture_step_evidence,
-                allow_screenshot_capture: drill.allow_screenshot_capture,
-                allow_image_targets: drill.allow_image_targets,
                 evidence_max_artifact_bytes: drill.evidence_max_artifact_bytes,
                 evidence_directory: evidence_dir.as_ref().map(|path| path.display().to_string()),
                 ..RunConfig::default()
             };
+            if let Some(profile) = drill.policy_profile {
+                profile.apply_to(&mut config);
+            }
+            config.allow_coordinate_targets |= drill.allow_coordinate_targets;
+            config.allow_path_only_selectors |= drill.allow_path_only_selectors;
+            config.allow_value_capture |= drill.allow_value_capture;
+            config.capture_step_evidence |= drill.capture_step_evidence;
+            config.allow_screenshot_capture |= drill.allow_screenshot_capture;
+            config.allow_image_targets |= drill.allow_image_targets;
 
             match executor.preflight(&definition, &config, &CurrentPlatformAdapter::new()) {
                 Ok(report) if report.can_run() => {}
                 Ok(report) => {
+                    let duration_millis = attempt_started_at.elapsed().as_millis();
                     let error = format!(
                         "automation preflight failed: {}",
                         preflight_messages(&report)
                     );
+                    let duration_matched = expected_duration_matches(drill, duration_millis);
                     let matched =
                         matches!(drill.expected_outcome, DrillExpectedOutcome::ExecutorError)
                             && drill.expected_failure_kind.is_none()
-                            && expected_error_matches(drill, &error);
+                            && expected_error_matches(drill, &error)
+                            && duration_matched;
                     all_matched &= matched;
                     results.push(serde_json::json!({
                         "id": drill.id,
                         "attempt": attempt,
                         "repeat": repeat,
-                        "durationMillis": attempt_started_at.elapsed().as_millis(),
+                        "durationMillis": duration_millis,
+                        "expectedMaxDurationMillis": drill.expected_max_duration_millis,
+                        "durationMatched": duration_matched,
                         "path": drill_path,
                         "expectedOutcome": drill.expected_outcome.as_str(),
                         "actualOutcome": "executorError",
@@ -560,17 +581,22 @@ fn run_drill_manifest(manifest_path: PathBuf) -> ExitCode {
                     continue;
                 }
                 Err(error) => {
+                    let duration_millis = attempt_started_at.elapsed().as_millis();
                     let error = error.to_string();
+                    let duration_matched = expected_duration_matches(drill, duration_millis);
                     let matched =
                         matches!(drill.expected_outcome, DrillExpectedOutcome::ExecutorError)
                             && drill.expected_failure_kind.is_none()
-                            && expected_error_matches(drill, &error);
+                            && expected_error_matches(drill, &error)
+                            && duration_matched;
                     all_matched &= matched;
                     results.push(serde_json::json!({
                         "id": drill.id,
                         "attempt": attempt,
                         "repeat": repeat,
-                        "durationMillis": attempt_started_at.elapsed().as_millis(),
+                        "durationMillis": duration_millis,
+                        "expectedMaxDurationMillis": drill.expected_max_duration_millis,
+                        "durationMatched": duration_matched,
                         "path": drill_path,
                         "expectedOutcome": drill.expected_outcome.as_str(),
                         "actualOutcome": "executorError",
@@ -588,12 +614,16 @@ fn run_drill_manifest(manifest_path: PathBuf) -> ExitCode {
                 match prune_evidence_directory(directory) {
                     Ok(report) => evidence_prune_report = Some(report),
                     Err(error) => {
+                        let duration_millis = attempt_started_at.elapsed().as_millis();
+                        let duration_matched = expected_duration_matches(drill, duration_millis);
                         all_matched = false;
                         results.push(serde_json::json!({
                             "id": drill.id,
                             "attempt": attempt,
                             "repeat": repeat,
-                            "durationMillis": attempt_started_at.elapsed().as_millis(),
+                            "durationMillis": duration_millis,
+                            "expectedMaxDurationMillis": drill.expected_max_duration_millis,
+                            "durationMatched": duration_matched,
                             "path": drill_path,
                             "expectedOutcome": drill.expected_outcome.as_str(),
                             "actualOutcome": "invalid",
@@ -620,6 +650,7 @@ fn run_drill_manifest(manifest_path: PathBuf) -> ExitCode {
 
             match report {
                 Ok(report) => {
+                    let duration_millis = attempt_started_at.elapsed().as_millis();
                     if let Some(evidence_dir) = evidence_dir.as_ref()
                         && let Err(error) = write_evidence_bundle(
                             evidence_dir,
@@ -634,7 +665,9 @@ fn run_drill_manifest(manifest_path: PathBuf) -> ExitCode {
                             "id": drill.id,
                             "attempt": attempt,
                             "repeat": repeat,
-                            "durationMillis": attempt_started_at.elapsed().as_millis(),
+                            "durationMillis": duration_millis,
+                            "expectedMaxDurationMillis": drill.expected_max_duration_millis,
+                            "durationMatched": expected_duration_matches(drill, duration_millis),
                             "path": drill_path,
                             "expectedOutcome": drill.expected_outcome.as_str(),
                             "actualOutcome": outcome_str(report.outcome),
@@ -646,16 +679,20 @@ fn run_drill_manifest(manifest_path: PathBuf) -> ExitCode {
                     let actual_failure_kind = report_failure_kind(&report);
                     let actual_error = report_error_message(&report);
                     let actual_log_matched = expected_log_matches(drill, &report);
+                    let duration_matched = expected_duration_matches(drill, duration_millis);
                     let matched = drill.expected_outcome.matches(report.outcome)
                         && expected_failure_kind_matches(drill, actual_failure_kind)
                         && expected_optional_error_matches(drill, actual_error.as_deref())
-                        && actual_log_matched;
+                        && actual_log_matched
+                        && duration_matched;
                     all_matched &= matched;
                     results.push(serde_json::json!({
                         "id": drill.id,
                         "attempt": attempt,
                         "repeat": repeat,
-                        "durationMillis": attempt_started_at.elapsed().as_millis(),
+                        "durationMillis": duration_millis,
+                        "expectedMaxDurationMillis": drill.expected_max_duration_millis,
+                        "durationMatched": duration_matched,
                         "path": drill_path,
                         "expectedOutcome": drill.expected_outcome.as_str(),
                         "actualOutcome": outcome_str(report.outcome),
@@ -665,21 +702,27 @@ fn run_drill_manifest(manifest_path: PathBuf) -> ExitCode {
                         "matched": matched,
                         "runId": report.run_id,
                         "eventCount": report.events.len(),
+                        "failureSummary": report_failure_summary(&report),
                         "evidencePrune": evidence_prune_json(evidence_prune_report.as_ref()),
                     }));
                 }
                 Err(error) => {
+                    let duration_millis = attempt_started_at.elapsed().as_millis();
                     let error = error.to_string();
+                    let duration_matched = expected_duration_matches(drill, duration_millis);
                     let matched =
                         matches!(drill.expected_outcome, DrillExpectedOutcome::ExecutorError)
                             && drill.expected_failure_kind.is_none()
-                            && expected_error_matches(drill, &error);
+                            && expected_error_matches(drill, &error)
+                            && duration_matched;
                     all_matched &= matched;
                     results.push(serde_json::json!({
                         "id": drill.id,
                         "attempt": attempt,
                         "repeat": repeat,
-                        "durationMillis": attempt_started_at.elapsed().as_millis(),
+                        "durationMillis": duration_millis,
+                        "expectedMaxDurationMillis": drill.expected_max_duration_millis,
+                        "durationMatched": duration_matched,
                         "path": drill_path,
                         "expectedOutcome": drill.expected_outcome.as_str(),
                         "actualOutcome": "executorError",
@@ -734,6 +777,43 @@ fn report_error_message(report: &RunReport) -> Option<String> {
     })
 }
 
+fn report_failure_summary(report: &RunReport) -> serde_json::Value {
+    report
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            RunEvent::StepFailed { step_id, error, .. } => Some(serde_json::json!({
+                "event": "stepFailed",
+                "stepId": step_id,
+                "errorKind": error.kind,
+                "failureKind": error.failure_kind,
+                "message": error.message,
+                "source": error.source,
+            })),
+            RunEvent::ManualIntervention { step_id, error, .. } => Some(serde_json::json!({
+                "event": "manualIntervention",
+                "stepId": step_id,
+                "errorKind": error.kind,
+                "failureKind": error.failure_kind,
+                "message": error.message,
+                "source": error.source,
+            })),
+            _ => None,
+        })
+        .unwrap_or_else(|| match report.outcome {
+            RunOutcome::Succeeded => serde_json::Value::Null,
+            RunOutcome::Failed => serde_json::json!({
+                "event": "runFailed",
+                "message": "run failed without a terminal step failure event",
+            }),
+            RunOutcome::Cancelled => serde_json::json!({
+                "event": "runCancelled",
+                "message": "run was cancelled without a terminal step failure event",
+            }),
+        })
+}
+
 fn expected_failure_kind_matches(
     drill: &DrillEntry,
     actual_failure_kind: Option<FailureKind>,
@@ -783,6 +863,12 @@ impl DrillExpectedOutcome {
             (Self::Succeeded, RunOutcome::Succeeded) | (Self::Failed, RunOutcome::Failed)
         )
     }
+}
+
+fn expected_duration_matches(drill: &DrillEntry, actual_duration_millis: u128) -> bool {
+    drill
+        .expected_max_duration_millis
+        .is_none_or(|expected| actual_duration_millis <= u128::from(expected))
 }
 
 fn outcome_str(outcome: RunOutcome) -> &'static str {
@@ -1013,6 +1099,7 @@ fn write_evidence_bundle(
             "events": artifact_uri(events_path),
             "artifactCount": artifacts.len(),
             "artifacts": artifacts,
+            "failureSummary": report_failure_summary(report),
             "retentionPolicy": {
                 "evidenceIsLocal": true,
                 "prunedBeforeRun": prune_report.is_some(),
@@ -1056,5 +1143,163 @@ mod tests {
             DrillExpectedOutcome::ExecutorError.as_str(),
             "executorError"
         );
+    }
+
+    #[test]
+    fn policy_profiles_apply_named_approval_sets() {
+        let mut evidence = RunConfig::default();
+        AutomationPolicyProfile::Evidence.apply_to(&mut evidence);
+        assert!(evidence.capture_step_evidence);
+        assert!(!evidence.allow_image_targets);
+
+        let mut visual = RunConfig::default();
+        AutomationPolicyProfile::VisualFallback.apply_to(&mut visual);
+        assert!(visual.capture_step_evidence);
+        assert!(visual.allow_screenshot_capture);
+        assert!(visual.allow_image_targets);
+        assert!(!visual.allow_coordinate_targets);
+
+        let mut lab = RunConfig::default();
+        AutomationPolicyProfile::UnsafeLab.apply_to(&mut lab);
+        assert!(lab.allow_coordinate_targets);
+        assert!(lab.allow_path_only_selectors);
+        assert!(lab.allow_value_capture);
+        assert!(lab.capture_step_evidence);
+        assert!(lab.allow_screenshot_capture);
+        assert!(lab.allow_image_targets);
+    }
+
+    #[test]
+    fn policy_profiles_parse_cli_aliases() {
+        assert_eq!(
+            AutomationPolicyProfile::from_cli("visual-fallback"),
+            Some(AutomationPolicyProfile::VisualFallback)
+        );
+        assert_eq!(
+            AutomationPolicyProfile::from_cli("unsafeLab"),
+            Some(AutomationPolicyProfile::UnsafeLab)
+        );
+        assert_eq!(AutomationPolicyProfile::from_cli("unknown"), None);
+    }
+
+    #[test]
+    fn expected_duration_matches_optional_maximum() {
+        let mut drill = DrillEntry {
+            id: "duration".to_string(),
+            path: PathBuf::from("duration.json"),
+            expected_outcome: DrillExpectedOutcome::Succeeded,
+            policy_profile: None,
+            allow_coordinate_targets: false,
+            allow_path_only_selectors: false,
+            allow_value_capture: false,
+            capture_step_evidence: false,
+            allow_screenshot_capture: false,
+            allow_image_targets: false,
+            evidence_max_artifact_bytes: None,
+            prune_evidence_before_run: false,
+            expected_failure_kind: None,
+            expected_error_contains: None,
+            expected_log_contains: None,
+            expected_max_duration_millis: None,
+            repeat: None,
+        };
+
+        assert!(expected_duration_matches(&drill, 10_000));
+        drill.expected_max_duration_millis = Some(500);
+        assert!(expected_duration_matches(&drill, 500));
+        assert!(!expected_duration_matches(&drill, 501));
+    }
+
+    #[test]
+    fn failure_summary_reports_terminal_step_failure() {
+        let report = RunReport {
+            run_id: "run-test".to_string(),
+            outcome: RunOutcome::Failed,
+            events: vec![RunEvent::StepFailed {
+                run_id: "run-test".to_string(),
+                automation_id: "automation-test".to_string(),
+                step_id: "step-test".to_string(),
+                error: cueflow_core::RunError {
+                    kind: cueflow_core::RunErrorKind::Adapter,
+                    message: "semantic target is disabled".to_string(),
+                    failure_kind: Some(FailureKind::Disabled),
+                    step_id: Some("step-test".to_string()),
+                    source: Some("failureKind=disabled".to_string()),
+                },
+            }],
+        };
+
+        assert_eq!(
+            report_failure_summary(&report),
+            serde_json::json!({
+                "event": "stepFailed",
+                "stepId": "step-test",
+                "errorKind": "adapter",
+                "failureKind": "disabled",
+                "message": "semantic target is disabled",
+                "source": "failureKind=disabled",
+            })
+        );
+    }
+
+    #[test]
+    fn failure_summary_reports_run_level_failures_without_step_events() {
+        let report = RunReport {
+            run_id: "run-test".to_string(),
+            outcome: RunOutcome::Failed,
+            events: Vec::new(),
+        };
+
+        assert_eq!(
+            report_failure_summary(&report),
+            serde_json::json!({
+                "event": "runFailed",
+                "message": "run failed without a terminal step failure event",
+            })
+        );
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum AutomationPolicyProfile {
+    Strict,
+    Evidence,
+    #[serde(alias = "visual-fallback")]
+    VisualFallback,
+    #[serde(alias = "unsafe-lab")]
+    UnsafeLab,
+}
+
+impl AutomationPolicyProfile {
+    fn from_cli(value: &str) -> Option<Self> {
+        match value {
+            "strict" => Some(Self::Strict),
+            "evidence" => Some(Self::Evidence),
+            "visual-fallback" | "visualFallback" => Some(Self::VisualFallback),
+            "unsafe-lab" | "unsafeLab" => Some(Self::UnsafeLab),
+            _ => None,
+        }
+    }
+
+    fn apply_to(self, config: &mut RunConfig) {
+        match self {
+            Self::Strict => {}
+            Self::Evidence => {
+                config.capture_step_evidence = true;
+            }
+            Self::VisualFallback => {
+                config.capture_step_evidence = true;
+                config.allow_screenshot_capture = true;
+                config.allow_image_targets = true;
+            }
+            Self::UnsafeLab => {
+                config.allow_coordinate_targets = true;
+                config.allow_path_only_selectors = true;
+                config.allow_value_capture = true;
+                config.capture_step_evidence = true;
+                config.allow_screenshot_capture = true;
+                config.allow_image_targets = true;
+            }
+        }
     }
 }

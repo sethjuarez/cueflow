@@ -12,8 +12,8 @@ use crate::{
     WindowIdentity,
 };
 use cueflow_core::{
-    Action, Artifact, Assertion, FailureKind, Platform, PreflightDiagnostic, PreflightSeverity,
-    RunConfig, Target, WaitCondition,
+    Action, Artifact, Assertion, FailureKind, ImageRegion, ImageTarget, Platform,
+    PreflightDiagnostic, PreflightSeverity, RunConfig, Target, WaitCondition,
 };
 use cueflow_executor::{AdapterError, ConditionState, EvidencePhase, ExecutionAdapter, RunControl};
 use windows::{
@@ -65,6 +65,7 @@ pub struct WindowsDesktopAdapter;
 
 const SEMANTIC_SEARCH_MAX_DEPTH: u32 = 16;
 const SEMANTIC_SEARCH_MAX_NODES: usize = 2_000;
+const VISUAL_MATCH_MAX_PIXEL_COMPARISONS: u64 = 50_000_000;
 
 impl WindowsDesktopAdapter {
     pub fn capabilities() -> AdapterCapabilities {
@@ -391,6 +392,10 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
                 reject_unsupported_target(unsupported_coordinate_target_reason(target, config))?;
                 click_coordinates(target).map(|_| Vec::new())
             }
+            Action::ClickTarget { target } if target.image.is_some() => {
+                reject_unsupported_target(unsupported_image_target_reason(target, config))?;
+                click_image_target(target, config).map(|_| Vec::new())
+            }
             Action::ClickTarget { target } => {
                 reject_unsupported_target(unsupported_semantic_target_reason_with_config(
                     target, config,
@@ -451,6 +456,9 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
                     ConditionState::Pending
                 }
             }),
+            WaitCondition::TargetExists { target } if target.image.is_some() => {
+                image_target_exists(target, config).map(condition_state)
+            }
             WaitCondition::TargetExists { target } => target_exists_state(target),
             WaitCondition::TargetFocused { target } => {
                 semantic_target_focused(target).map(condition_state)
@@ -463,6 +471,9 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
             }
             WaitCondition::TargetActionable { target } => {
                 semantic_target_actionable(target).map(condition_state)
+            }
+            WaitCondition::TargetNotExists { target } if target.image.is_some() => {
+                image_target_exists(target, config).map(|exists| condition_state(!exists))
             }
             WaitCondition::TargetNotExists { target } => {
                 semantic_target_exists(target).map(|exists| condition_state(!exists))
@@ -545,6 +556,9 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
         config: &RunConfig,
     ) -> Result<bool, AdapterError> {
         match assertion {
+            Assertion::TargetExists { target } if target.image.is_some() => {
+                image_target_exists(target, config)
+            }
             Assertion::TargetExists { target } if target.accessibility.is_some() => {
                 semantic_target_exists(target)
             }
@@ -560,6 +574,9 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
         target: &Target,
         _config: &RunConfig,
     ) -> Result<bool, AdapterError> {
+        if target.image.is_some() {
+            return image_target_exists(target, _config);
+        }
         semantic_target_exists(target)
     }
 
@@ -881,7 +898,11 @@ fn click_coordinates(target: &Target) -> Result<(), AdapterError> {
     let coordinates = target
         .coordinates
         .ok_or_else(|| AdapterError::unsupported("coordinate clicks require coordinates"))?;
-    unsafe { SetCursorPos(coordinates.x, coordinates.y) }
+    click_screen_point(coordinates.x, coordinates.y)
+}
+
+fn click_screen_point(x: i32, y: i32) -> Result<(), AdapterError> {
+    unsafe { SetCursorPos(x, y) }
         .map_err(|_| AdapterError::new("Windows could not move the pointer to the target"))?;
     let inputs = [
         INPUT {
@@ -1126,6 +1147,19 @@ fn capture_window_screenshot_with_limit(
     path: &Path,
     evidence_config: Option<&RunConfig>,
 ) -> Result<Artifact, AdapterError> {
+    let bitmap = capture_window_bitmap(window, evidence_config)?;
+    write_bmp(path, bitmap.width, bitmap.height, &bitmap.pixels)?;
+    Ok(Artifact {
+        kind: cueflow_core::ArtifactKind::Screenshot,
+        uri: format!("file://{}", strip_verbatim_path_prefix(&path_display(path))),
+        label: Some("Window screenshot".to_string()),
+    })
+}
+
+fn capture_window_bitmap(
+    window: HWND,
+    evidence_config: Option<&RunConfig>,
+) -> Result<BmpImage, AdapterError> {
     let rect = window_bounds(window)
         .ok_or_else(|| AdapterError::new("Windows could not determine window bounds"))?;
     let width = rect.right - rect.left;
@@ -1190,11 +1224,10 @@ fn capture_window_screenshot_with_limit(
             }
 
             let pixels = bitmap_pixels(memory_dc, bitmap, width, height)?;
-            write_bmp(path, width, height, &pixels)?;
-            Ok(Artifact {
-                kind: cueflow_core::ArtifactKind::Screenshot,
-                uri: format!("file://{}", strip_verbatim_path_prefix(&path_display(path))),
-                label: Some("Window screenshot".to_string()),
+            Ok(BmpImage {
+                width,
+                height,
+                pixels,
             })
         })();
 
@@ -1250,6 +1283,22 @@ fn bitmap_pixels(
     Ok(pixels)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BmpImage {
+    width: i32,
+    height: i32,
+    pixels: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VisualMatch {
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+    confidence: u8,
+}
+
 fn bmp_file_size(width: i32, height: i32) -> Result<u64, AdapterError> {
     let width =
         u64::try_from(width).map_err(|_| transient_error("Windows screenshot width is invalid"))?;
@@ -1291,6 +1340,211 @@ fn write_bmp(path: &Path, width: i32, height: i32, pixels: &[u8]) -> Result<(), 
         })?;
     }
     fs::write(path, output).map_err(|_| transient_error("Windows could not write screenshot"))
+}
+
+fn read_bmp_image(path: &Path) -> Result<BmpImage, AdapterError> {
+    let bytes =
+        fs::read(path).map_err(|_| AdapterError::new("Windows could not read image target"))?;
+    parse_bmp_image(&bytes)
+}
+
+fn parse_bmp_image(bytes: &[u8]) -> Result<BmpImage, AdapterError> {
+    if bytes.len() < 54 || &bytes[0..2] != b"BM" {
+        return Err(AdapterError::new(
+            "image target must be an uncompressed 32bpp BMP",
+        ));
+    }
+    let pixel_offset = read_u32_le(bytes, 10)? as usize;
+    let dib_size = read_u32_le(bytes, 14)?;
+    if dib_size < 40 || bytes.len() < pixel_offset {
+        return Err(AdapterError::new("image target BMP header is invalid"));
+    }
+    let width = read_i32_le(bytes, 18)?;
+    let raw_height = read_i32_le(bytes, 22)?;
+    let planes = read_u16_le(bytes, 26)?;
+    let bits_per_pixel = read_u16_le(bytes, 28)?;
+    let compression = read_u32_le(bytes, 30)?;
+    if width <= 0 || raw_height == 0 || planes != 1 || bits_per_pixel != 32 || compression != 0 {
+        return Err(AdapterError::new(
+            "image target must be an uncompressed 32bpp BMP",
+        ));
+    }
+
+    let height = raw_height.unsigned_abs() as i32;
+    let row_stride = width as usize * 4;
+    let pixel_len = row_stride
+        .checked_mul(height as usize)
+        .ok_or_else(|| AdapterError::new("image target BMP dimensions overflowed"))?;
+    if bytes.len() < pixel_offset + pixel_len {
+        return Err(AdapterError::new(
+            "image target BMP pixel data is truncated",
+        ));
+    }
+
+    let mut pixels = vec![0u8; pixel_len];
+    let source = &bytes[pixel_offset..pixel_offset + pixel_len];
+    if raw_height < 0 {
+        pixels.copy_from_slice(source);
+    } else {
+        for row in 0..height as usize {
+            let source_start = (height as usize - 1 - row) * row_stride;
+            let target_start = row * row_stride;
+            pixels[target_start..target_start + row_stride]
+                .copy_from_slice(&source[source_start..source_start + row_stride]);
+        }
+    }
+
+    Ok(BmpImage {
+        width,
+        height,
+        pixels,
+    })
+}
+
+fn read_u16_le(bytes: &[u8], offset: usize) -> Result<u16, AdapterError> {
+    bytes
+        .get(offset..offset + 2)
+        .and_then(|value| value.try_into().ok())
+        .map(u16::from_le_bytes)
+        .ok_or_else(|| AdapterError::new("image target BMP header is truncated"))
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Result<u32, AdapterError> {
+    bytes
+        .get(offset..offset + 4)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| AdapterError::new("image target BMP header is truncated"))
+}
+
+fn read_i32_le(bytes: &[u8], offset: usize) -> Result<i32, AdapterError> {
+    bytes
+        .get(offset..offset + 4)
+        .and_then(|value| value.try_into().ok())
+        .map(i32::from_le_bytes)
+        .ok_or_else(|| AdapterError::new("image target BMP header is truncated"))
+}
+
+fn find_template_match(
+    screenshot: &BmpImage,
+    template: &BmpImage,
+    image: &ImageTarget,
+) -> Result<Option<VisualMatch>, AdapterError> {
+    if template.width <= 0
+        || template.height <= 0
+        || template.width > screenshot.width
+        || template.height > screenshot.height
+    {
+        return Ok(None);
+    }
+    let threshold = image.confidence.unwrap_or(100).min(100);
+    let (left, top, right, bottom) =
+        match visual_search_bounds(screenshot, template, image.region.as_ref()) {
+            Some(bounds) => bounds,
+            None => return Ok(None),
+        };
+    enforce_visual_search_budget(left, top, right, bottom, template)?;
+    let mut best = None;
+    for y in top..=bottom {
+        for x in left..=right {
+            let confidence = template_confidence(screenshot, template, x, y);
+            if confidence >= threshold {
+                return Ok(Some(VisualMatch {
+                    left: x,
+                    top: y,
+                    width: template.width,
+                    height: template.height,
+                    confidence,
+                }));
+            }
+            if best
+                .as_ref()
+                .is_none_or(|candidate: &VisualMatch| confidence > candidate.confidence)
+            {
+                best = Some(VisualMatch {
+                    left: x,
+                    top: y,
+                    width: template.width,
+                    height: template.height,
+                    confidence,
+                });
+            }
+        }
+    }
+    Ok(best.filter(|candidate| candidate.confidence >= threshold))
+}
+
+fn visual_search_bounds(
+    screenshot: &BmpImage,
+    template: &BmpImage,
+    region: Option<&ImageRegion>,
+) -> Option<(i32, i32, i32, i32)> {
+    let max_left = screenshot.width - template.width;
+    let max_top = screenshot.height - template.height;
+    match region {
+        Some(region) => {
+            let region_right = region.left.checked_add(i32::try_from(region.width).ok()?)?;
+            let region_bottom = region.top.checked_add(i32::try_from(region.height).ok()?)?;
+            let left = region.left.max(0);
+            let top = region.top.max(0);
+            let right = (region_right - template.width).min(max_left);
+            let bottom = (region_bottom - template.height).min(max_top);
+            (left <= right && top <= bottom).then_some((left, top, right, bottom))
+        }
+        None => Some((0, 0, max_left, max_top)),
+    }
+}
+
+fn enforce_visual_search_budget(
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    template: &BmpImage,
+) -> Result<(), AdapterError> {
+    let positions = u64::try_from(right - left + 1)
+        .ok()
+        .and_then(|width| {
+            u64::try_from(bottom - top + 1)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or_else(|| AdapterError::new("image target search bounds overflowed"))?;
+    let template_pixels = u64::try_from(template.width)
+        .ok()
+        .and_then(|width| {
+            u64::try_from(template.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or_else(|| AdapterError::new("image target template size overflowed"))?;
+    let comparisons = positions
+        .checked_mul(template_pixels)
+        .ok_or_else(|| AdapterError::new("image target search budget overflowed"))?;
+    if comparisons > VISUAL_MATCH_MAX_PIXEL_COMPARISONS {
+        return Err(AdapterError::unsupported(
+            "image target search is too large; provide a bounded image region or smaller template",
+        ));
+    }
+    Ok(())
+}
+
+fn template_confidence(screenshot: &BmpImage, template: &BmpImage, left: i32, top: i32) -> u8 {
+    let mut matching = 0usize;
+    let total = template.width as usize * template.height as usize;
+    for y in 0..template.height {
+        for x in 0..template.width {
+            if rgb_at(screenshot, left + x, top + y) == rgb_at(template, x, y) {
+                matching += 1;
+            }
+        }
+    }
+    ((matching * 100) / total) as u8
+}
+
+fn rgb_at(image: &BmpImage, x: i32, y: i32) -> &[u8] {
+    let offset = ((y as usize * image.width as usize) + x as usize) * 4;
+    &image.pixels[offset..offset + 3]
 }
 
 fn path_display(path: &Path) -> String {
@@ -1847,6 +2101,45 @@ fn semantic_target_exists(target: &Target) -> Result<bool, AdapterError> {
         Err(error) if is_target_absent(&error) => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+fn image_target_exists(target: &Target, config: &RunConfig) -> Result<bool, AdapterError> {
+    visual_match(target, config).map(|match_result| match_result.is_some())
+}
+
+fn click_image_target(target: &Target, config: &RunConfig) -> Result<(), AdapterError> {
+    let window = find_window(target)?;
+    let bounds = window_bounds(window)
+        .ok_or_else(|| AdapterError::new("Windows could not determine window bounds"))?;
+    let matched = visual_match_in_window(target, config, window)?.ok_or_else(|| {
+        AdapterError::new("requested image target was not found")
+            .with_failure_kind(FailureKind::NotFound)
+            .with_source("failureKind=notFound; visualTarget=image")
+    })?;
+    click_screen_point(
+        bounds.left + matched.left + (matched.width / 2),
+        bounds.top + matched.top + (matched.height / 2),
+    )
+}
+
+fn visual_match(target: &Target, config: &RunConfig) -> Result<Option<VisualMatch>, AdapterError> {
+    let window = find_window(target)?;
+    visual_match_in_window(target, config, window)
+}
+
+fn visual_match_in_window(
+    target: &Target,
+    config: &RunConfig,
+    window: HWND,
+) -> Result<Option<VisualMatch>, AdapterError> {
+    reject_unsupported_target(unsupported_image_action_target_reason(target, config))?;
+    let image = target
+        .image
+        .as_ref()
+        .ok_or_else(|| AdapterError::unsupported("visual matching requires an image target"))?;
+    let screenshot = capture_window_bitmap(window, Some(config))?;
+    let template = read_bmp_image(Path::new(&image.path))?;
+    find_template_match(&screenshot, &template, image)
 }
 
 fn ensure_semantic_target_actionable(element: &IUIAutomationElement) -> Result<(), AdapterError> {
@@ -2662,6 +2955,9 @@ fn unsupported_action_reason(action: &Action, config: &RunConfig) -> Option<&'st
         Action::ClickTarget { target } if target.coordinates.is_some() => {
             unsupported_coordinate_target_reason(target, config)
         }
+        Action::ClickTarget { target } if target.image.is_some() => {
+            unsupported_image_action_target_reason(target, config)
+        }
         Action::ClickTarget { target }
         | Action::TypeText {
             target: Some(target),
@@ -2678,6 +2974,9 @@ fn unsupported_action_reason(action: &Action, config: &RunConfig) -> Option<&'st
         Action::RunCommand { command, .. } => unsupported_command_reason(command, config),
         Action::WaitFor { condition } => unsupported_wait_reason(condition, config),
         Action::Assert { assertion } => match assertion {
+            Assertion::TargetExists { target } if target.image.is_some() => {
+                unsupported_image_action_target_reason(target, config)
+            }
             Assertion::TargetExists { target } if target.accessibility.is_some() => {
                 unsupported_semantic_target_reason_with_config(target, config)
             }
@@ -2703,6 +3002,11 @@ fn unsupported_wait_reason(condition: &WaitCondition, config: &RunConfig) -> Opt
             unsupported_semantic_target_reason_with_config(target, config)
         }
         WaitCondition::WindowFocused { target } => unsupported_window_target_reason(target),
+        WaitCondition::TargetExists { target } | WaitCondition::TargetNotExists { target }
+            if target.image.is_some() =>
+        {
+            unsupported_image_action_target_reason(target, config)
+        }
         WaitCondition::TargetExists { target }
         | WaitCondition::TargetFocused { target }
         | WaitCondition::TargetEnabled { target }
@@ -2731,6 +3035,11 @@ fn unsupported_semantic_target_reason_with_config(
 ) -> Option<&'static str> {
     if let Some(reason) = unsupported_image_target_reason(target, config) {
         return Some(reason);
+    }
+    if target.image.is_some() {
+        return Some(
+            "Windows semantic target operations do not support image selectors; use accessibility selectors or clickTarget image matching",
+        );
     }
     if target.accessibility.is_none() {
         return Some("semantic target operations require an accessibility selector");
@@ -2767,6 +3076,18 @@ fn unsupported_launch_target_reason(target: &Target, config: &RunConfig) -> Opti
         return Some(reason);
     }
     unsupported_window_target_reason(target)
+}
+
+fn unsupported_image_action_target_reason(
+    target: &Target,
+    config: &RunConfig,
+) -> Option<&'static str> {
+    if let Some(reason) = unsupported_image_target_reason(target, config) {
+        return Some(reason);
+    }
+    let mut window_target = target.clone();
+    window_target.image = None;
+    unsupported_window_target_reason(&window_target)
 }
 
 fn reject_unsupported_target(reason: Option<&'static str>) -> Result<(), AdapterError> {
@@ -2833,9 +3154,10 @@ fn unsupported_image_target_reason(target: &Target, config: &RunConfig) -> Optio
     if !config.allow_image_targets {
         return Some("image targets require explicit allowImageTargets approval");
     }
-    Some(
-        "Windows image target matching is not implemented yet; use accessibility selectors for reliable automation",
-    )
+    if !config.allow_screenshot_capture {
+        return Some("image target matching requires explicit allowScreenshotCapture approval");
+    }
+    None
 }
 
 fn unsupported_process_target_reason(target: &Target) -> Option<&'static str> {
@@ -2876,6 +3198,25 @@ mod tests {
                 path: Some(Vec::new()),
             }),
             image: None,
+            coordinates: None,
+            platform_selectors: BTreeMap::new(),
+        }
+    }
+
+    fn window_target_with_image(path: &str) -> Target {
+        Target {
+            app_name: None,
+            process_name: None,
+            window_title: Some("Settings".to_string()),
+            title_contains: None,
+            url: None,
+            file_path: None,
+            accessibility: None,
+            image: Some(cueflow_core::ImageTarget {
+                path: path.to_string(),
+                confidence: None,
+                region: None,
+            }),
             coordinates: None,
             platform_selectors: BTreeMap::new(),
         }
@@ -3138,6 +3479,41 @@ mod tests {
             diagnostics[0].message,
             "image targets require explicit allowImageTargets approval"
         );
+    }
+
+    #[test]
+    fn preflight_accepts_image_target_exists_only_with_visual_policy() {
+        let adapter = WindowsDesktopAdapter;
+        let action = Action::WaitFor {
+            condition: WaitCondition::TargetExists {
+                target: window_target_with_image("fixtures/settings-search.bmp"),
+            },
+        };
+
+        let default_diagnostics = adapter.preflight(&action, &RunConfig::default());
+        assert_eq!(default_diagnostics.len(), 1);
+        assert_eq!(
+            default_diagnostics[0].message,
+            "image targets require explicit allowImageTargets approval"
+        );
+
+        let missing_screenshot_policy = RunConfig {
+            allow_image_targets: true,
+            ..RunConfig::default()
+        };
+        let missing_screenshot_diagnostics = adapter.preflight(&action, &missing_screenshot_policy);
+        assert_eq!(missing_screenshot_diagnostics.len(), 1);
+        assert_eq!(
+            missing_screenshot_diagnostics[0].message,
+            "image target matching requires explicit allowScreenshotCapture approval"
+        );
+
+        let visual_policy = RunConfig {
+            allow_image_targets: true,
+            allow_screenshot_capture: true,
+            ..RunConfig::default()
+        };
+        assert!(adapter.preflight(&action, &visual_policy).is_empty());
     }
 
     #[test]
@@ -3699,6 +4075,121 @@ mod tests {
         assert_eq!(i32::from_le_bytes(bytes[22..26].try_into().unwrap()), -1);
         assert_eq!(u16::from_le_bytes(bytes[28..30].try_into().unwrap()), 32);
         assert_eq!(&bytes[54..], &pixels);
+    }
+
+    #[test]
+    fn bmp_reader_round_trips_top_down_32bpp_bitmaps() {
+        let path = std::env::temp_dir().join(format!(
+            "cueflow-read-bmp-{}-{}.bmp",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let pixels = [
+            0x01, 0x02, 0x03, 0xff, 0x04, 0x05, 0x06, 0xff, 0x07, 0x08, 0x09, 0xff, 0x0a, 0x0b,
+            0x0c, 0xff,
+        ];
+
+        write_bmp(&path, 2, 2, &pixels).expect("bmp writes");
+        let image = read_bmp_image(&path).expect("bmp reads");
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(image.width, 2);
+        assert_eq!(image.height, 2);
+        assert_eq!(image.pixels, pixels);
+    }
+
+    #[test]
+    fn visual_template_match_respects_region_and_confidence() {
+        let screenshot = BmpImage {
+            width: 3,
+            height: 3,
+            pixels: vec![
+                0, 0, 0, 255, 1, 1, 1, 255, 2, 2, 2, 255, 3, 3, 3, 255, 9, 9, 9, 255, 8, 8, 8, 255,
+                4, 4, 4, 255, 7, 7, 7, 255, 6, 6, 6, 255,
+            ],
+        };
+        let template = BmpImage {
+            width: 2,
+            height: 2,
+            pixels: vec![9, 9, 9, 255, 8, 8, 8, 255, 7, 7, 7, 255, 6, 6, 6, 255],
+        };
+        let image = ImageTarget {
+            path: "template.bmp".to_string(),
+            confidence: Some(100),
+            region: Some(ImageRegion {
+                left: 1,
+                top: 1,
+                width: 2,
+                height: 2,
+            }),
+        };
+
+        let matched = find_template_match(&screenshot, &template, &image)
+            .expect("search succeeds")
+            .expect("match");
+
+        assert_eq!(
+            matched,
+            VisualMatch {
+                left: 1,
+                top: 1,
+                width: 2,
+                height: 2,
+                confidence: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn visual_template_match_ignores_alpha_channel() {
+        let screenshot = BmpImage {
+            width: 1,
+            height: 1,
+            pixels: vec![10, 20, 30, 0],
+        };
+        let template = BmpImage {
+            width: 1,
+            height: 1,
+            pixels: vec![10, 20, 30, 255],
+        };
+        let image = ImageTarget {
+            path: "template.bmp".to_string(),
+            confidence: Some(100),
+            region: None,
+        };
+
+        let matched = find_template_match(&screenshot, &template, &image)
+            .expect("search succeeds")
+            .expect("match ignores alpha");
+
+        assert_eq!(matched.confidence, 100);
+    }
+
+    #[test]
+    fn visual_template_match_requires_bounded_search_budget() {
+        let screenshot = BmpImage {
+            width: 8_000,
+            height: 8_000,
+            pixels: Vec::new(),
+        };
+        let template = BmpImage {
+            width: 100,
+            height: 100,
+            pixels: Vec::new(),
+        };
+        let image = ImageTarget {
+            path: "template.bmp".to_string(),
+            confidence: Some(100),
+            region: None,
+        };
+
+        let error = find_template_match(&screenshot, &template, &image)
+            .expect_err("unbounded large search is rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "image target search is too large; provide a bounded image region or smaller template"
+        );
     }
 
     #[test]
