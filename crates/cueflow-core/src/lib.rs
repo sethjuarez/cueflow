@@ -1633,6 +1633,7 @@ pub enum FailureKind {
     Offscreen,
     FocusDenied,
     PolicyDenied,
+    CapabilityUnavailable,
     UnsupportedAction,
     Timeout,
     Cancelled,

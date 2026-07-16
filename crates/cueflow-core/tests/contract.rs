@@ -306,11 +306,10 @@ fn macos_semantic_drill_manifest_remains_well_formed() {
 
     assert_eq!(manifest["id"], "macos-semantic-foundation-drills");
     assert!(
-        manifest["drills"]
+        !manifest["drills"]
             .as_array()
             .expect("drills is an array")
-            .len()
-            >= 1
+            .is_empty()
     );
 }
 

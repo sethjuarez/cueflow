@@ -740,7 +740,7 @@ fn ensure_accessibility_permission() -> Result<(), AdapterError> {
     } else {
         Err(
             AdapterError::new("macOS Accessibility permission is required for semantic automation")
-                .with_failure_kind(FailureKind::UnsupportedAction)
+                .with_failure_kind(FailureKind::CapabilityUnavailable)
                 .with_source("failureKind=capabilityUnavailable"),
         )
     }

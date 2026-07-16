@@ -130,16 +130,14 @@ impl WindowsDesktopAdapter {
             };
             let mut remaining = max_nodes;
             let mut truncated = false;
-            let root = inspect_accessibility_node(
-                &root,
-                &condition,
-                &[],
-                &window_title,
-                max_depth,
+            let mut inspect_state = AccessibilityInspectState {
+                condition: &condition,
+                window_title: &window_title,
                 include_values,
-                &mut remaining,
-                &mut truncated,
-            )?;
+                remaining_nodes: &mut remaining,
+                truncated: &mut truncated,
+            };
+            let root = inspect_accessibility_node(&root, &[], max_depth, &mut inspect_state)?;
 
             Ok(AccessibilityTree {
                 platform: Platform::Windows,
@@ -2047,7 +2045,7 @@ fn window_identity(window: HWND) -> Option<WindowIdentity> {
 
 fn window_owner(window: HWND) -> Option<HWND> {
     let owner = unsafe { GetWindow(window, GW_OWNER) }.ok()?;
-    (owner.0 != std::ptr::null_mut()).then_some(owner)
+    (!owner.0.is_null()).then_some(owner)
 }
 
 fn window_bounds(window: HWND) -> Option<AccessibilityBounds> {
@@ -2290,79 +2288,80 @@ fn has_failure_kind(error: &AdapterError, kind: FailureKind) -> bool {
     error.failure_kind() == Some(kind)
 }
 
+struct AccessibilityInspectState<'a> {
+    condition: &'a IUIAutomationCondition,
+    window_title: &'a str,
+    include_values: bool,
+    remaining_nodes: &'a mut usize,
+    truncated: &'a mut bool,
+}
+
 fn inspect_accessibility_node(
     element: &IUIAutomationElement,
-    condition: &IUIAutomationCondition,
     path: &[u32],
-    window_title: &str,
     depth_remaining: u32,
-    include_values: bool,
-    remaining_nodes: &mut usize,
-    truncated: &mut bool,
+    state: &mut AccessibilityInspectState<'_>,
 ) -> Result<AccessibilityNode, AdapterError> {
-    if *remaining_nodes == 0 {
-        *truncated = true;
+    if *state.remaining_nodes == 0 {
+        *state.truncated = true;
         return Err(AdapterError::new(
             "Windows accessibility inspection exceeded the node limit",
         ));
     }
-    *remaining_nodes -= 1;
+    *state.remaining_nodes -= 1;
 
     let mut children = Vec::new();
     if depth_remaining > 0 {
-        let Ok(child_elements) = (unsafe { element.FindAll(TreeScope_Children, condition) }) else {
-            *truncated = true;
+        let Ok(child_elements) = (unsafe { element.FindAll(TreeScope_Children, state.condition) })
+        else {
+            *state.truncated = true;
             return Ok(inspected_accessibility_node(
                 element,
                 path,
-                window_title,
-                include_values,
+                state.window_title,
+                state.include_values,
                 children,
             ));
         };
         let Ok(child_count) = (unsafe { child_elements.Length() }) else {
-            *truncated = true;
+            *state.truncated = true;
             return Ok(inspected_accessibility_node(
                 element,
                 path,
-                window_title,
-                include_values,
+                state.window_title,
+                state.include_values,
                 children,
             ));
         };
         for index in 0..child_count {
-            if *remaining_nodes == 0 {
-                *truncated = true;
+            if *state.remaining_nodes == 0 {
+                *state.truncated = true;
                 break;
             }
             let Ok(child) = (unsafe { child_elements.GetElement(index) }) else {
-                *truncated = true;
+                *state.truncated = true;
                 continue;
             };
             children.push(inspect_accessibility_node(
                 &child,
-                condition,
                 &[path, &[index as u32]].concat(),
-                window_title,
                 depth_remaining - 1,
-                include_values,
-                remaining_nodes,
-                truncated,
+                state,
             )?);
         }
     } else {
-        match has_children(element, condition) {
-            Ok(true) => *truncated = true,
+        match has_children(element, state.condition) {
+            Ok(true) => *state.truncated = true,
             Ok(false) => {}
-            Err(_) => *truncated = true,
+            Err(_) => *state.truncated = true,
         }
     }
 
     Ok(inspected_accessibility_node(
         element,
         path,
-        window_title,
-        include_values,
+        state.window_title,
+        state.include_values,
         children,
     ))
 }
@@ -2420,10 +2419,7 @@ fn selector_candidates(
     if !automation_id.is_empty() && !control_type.is_empty() {
         candidates.push(selector_candidate(
             window_title,
-            Some(automation_id),
-            None,
-            Some(control_type),
-            None,
+            selector_target(Some(automation_id), None, Some(control_type), None),
             SelectorConfidence::High,
             95,
             "Automation id plus control type is usually the most stable UIA selector.",
@@ -2433,10 +2429,7 @@ fn selector_candidates(
     if !automation_id.is_empty() {
         candidates.push(selector_candidate(
             window_title,
-            Some(automation_id),
-            None,
-            None,
-            None,
+            selector_target(Some(automation_id), None, None, None),
             SelectorConfidence::High,
             90,
             "Automation id is stable when the application provides it.",
@@ -2446,10 +2439,7 @@ fn selector_candidates(
     if !name.is_empty() && !control_type.is_empty() {
         candidates.push(selector_candidate(
             window_title,
-            None,
-            Some(name),
-            Some(control_type),
-            None,
+            selector_target(None, Some(name), Some(control_type), None),
             SelectorConfidence::Medium,
             70,
             "Name plus control type is readable but can change with localization or content.",
@@ -2459,14 +2449,12 @@ fn selector_candidates(
     if !path.is_empty() {
         candidates.push(selector_candidate(
             window_title,
-            None,
-            None,
-            if control_type.is_empty() {
-                None
-            } else {
-                Some(control_type)
-            },
-            Some(path),
+            selector_target(
+                None,
+                None,
+                (!control_type.is_empty()).then_some(control_type),
+                Some(path),
+            ),
             SelectorConfidence::Low,
             45,
             "Path can target elements without names or ids, but sibling insertions can shift it.",
@@ -2478,12 +2466,23 @@ fn selector_candidates(
     candidates
 }
 
-fn selector_candidate(
-    window_title: &str,
+fn selector_target(
     id: Option<&str>,
     name: Option<&str>,
     control_type: Option<&str>,
     path: Option<&[u32]>,
+) -> cueflow_core::AccessibilityTarget {
+    cueflow_core::AccessibilityTarget {
+        id: id.map(str::to_string),
+        name: name.map(str::to_string),
+        control_type: control_type.map(str::to_string),
+        path: path.map(<[u32]>::to_vec),
+    }
+}
+
+fn selector_candidate(
+    window_title: &str,
+    accessibility: cueflow_core::AccessibilityTarget,
     confidence: SelectorConfidence,
     score: u8,
     rationale: &str,
@@ -2499,12 +2498,7 @@ fn selector_candidate(
             title_contains: None,
             url: None,
             file_path: None,
-            accessibility: Some(cueflow_core::AccessibilityTarget {
-                id: id.map(str::to_string),
-                name: name.map(str::to_string),
-                control_type: control_type.map(str::to_string),
-                path: path.map(<[u32]>::to_vec),
-            }),
+            accessibility: Some(accessibility),
             image: None,
             coordinates: None,
             platform_selectors: BTreeMap::new(),
@@ -2718,17 +2712,15 @@ fn with_semantic_target<T>(
             let mut inspected = Vec::new();
             let mut remaining_nodes = SEMANTIC_SEARCH_MAX_NODES;
             let mut truncated = false;
-            collect_semantic_matches(
-                &root,
-                &condition,
+            let mut search_state = SemanticSearchState {
+                condition: &condition,
                 accessibility,
-                &[],
-                SEMANTIC_SEARCH_MAX_DEPTH,
-                &mut remaining_nodes,
-                &mut truncated,
-                &mut matching,
-                &mut inspected,
-            )?;
+                remaining_nodes: &mut remaining_nodes,
+                truncated: &mut truncated,
+                matching: &mut matching,
+                inspected: &mut inspected,
+            };
+            collect_semantic_matches(&root, &[], SEMANTIC_SEARCH_MAX_DEPTH, &mut search_state)?;
             if truncated {
                 return Err(
                     AdapterError::new("requested semantic target search was truncated")
@@ -2814,65 +2806,65 @@ fn semantic_target_not_found() -> AdapterError {
         .with_source("failureKind=notFound")
 }
 
+struct SemanticSearchState<'a> {
+    condition: &'a IUIAutomationCondition,
+    accessibility: &'a cueflow_core::AccessibilityTarget,
+    remaining_nodes: &'a mut usize,
+    truncated: &'a mut bool,
+    matching: &'a mut Vec<SemanticMatch>,
+    inspected: &'a mut Vec<String>,
+}
+
 fn collect_semantic_matches(
     element: &IUIAutomationElement,
-    condition: &IUIAutomationCondition,
-    accessibility: &cueflow_core::AccessibilityTarget,
     path: &[u32],
     depth_remaining: u32,
-    remaining_nodes: &mut usize,
-    truncated: &mut bool,
-    matching: &mut Vec<SemanticMatch>,
-    inspected: &mut Vec<String>,
+    state: &mut SemanticSearchState<'_>,
 ) -> Result<(), AdapterError> {
-    if *remaining_nodes == 0 {
-        *truncated = true;
+    if *state.remaining_nodes == 0 {
+        *state.truncated = true;
         return Ok(());
     }
-    *remaining_nodes -= 1;
+    *state.remaining_nodes -= 1;
 
     let summary = element_summary(element, path)?;
-    if inspected.len() < 12 {
-        inspected.push(summary.clone());
+    if state.inspected.len() < 12 {
+        state.inspected.push(summary.clone());
     }
-    if accessibility_matches(element, accessibility, path)? {
-        matching.push(SemanticMatch {
+    if accessibility_matches(element, state.accessibility, path)? {
+        state.matching.push(SemanticMatch {
             element: element.clone(),
             summary,
         });
     }
     if depth_remaining == 0 {
-        *truncated = true;
+        *state.truncated = true;
         return Ok(());
     }
 
-    let Ok(child_elements) = (unsafe { element.FindAll(TreeScope_Children, condition) }) else {
-        *truncated = true;
+    let Ok(child_elements) = (unsafe { element.FindAll(TreeScope_Children, state.condition) })
+    else {
+        *state.truncated = true;
         return Ok(());
     };
     let Ok(child_count) = (unsafe { child_elements.Length() }) else {
-        *truncated = true;
+        *state.truncated = true;
         return Ok(());
     };
     for index in 0..child_count {
-        if *remaining_nodes == 0 {
-            *truncated = true;
+        if *state.remaining_nodes == 0 {
+            *state.truncated = true;
             break;
         }
         let Ok(child) = (unsafe { child_elements.GetElement(index) }) else {
-            *truncated = true;
+            *state.truncated = true;
             continue;
         };
         collect_semantic_matches(
             &child,
-            condition,
-            accessibility,
             &[path, &[index as u32]].concat(),
             depth_remaining - 1,
-            remaining_nodes,
-            truncated,
-            matching,
-            inspected,
+            state,
         )?;
     }
     Ok(())

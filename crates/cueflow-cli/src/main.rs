@@ -1024,7 +1024,7 @@ struct EvidencePruneReport {
     steps_removed: bool,
 }
 
-fn prune_evidence_directory(directory: &PathBuf) -> std::io::Result<EvidencePruneReport> {
+fn prune_evidence_directory(directory: &std::path::Path) -> std::io::Result<EvidencePruneReport> {
     let mut report = EvidencePruneReport::default();
     let events_path = directory.join("events.jsonl");
     match fs::remove_file(&events_path) {
