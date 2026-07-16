@@ -8,17 +8,43 @@
       "expectedOutcome": "succeeded",
       "allowPathOnlySelectors": true,
       "captureStepEvidence": true,
-      "pruneEvidenceBeforeRun": true
+      "pruneEvidenceBeforeRun": true,
+      "repeat": 2
     },
     {
       "id": "missing-window-timeout",
       "path": "windows-missing-window-timeout-drill.json",
-      "expectedOutcome": "failed"
+      "expectedOutcome": "failed",
+      "expectedFailureKind": "timeout",
+      "expectedErrorContains": "step timed out"
     },
     {
       "id": "image-target-policy",
       "path": "windows-image-target-policy-drill.json",
-      "expectedOutcome": "executorError"
+      "expectedOutcome": "executorError",
+      "expectedErrorContains": "image targets require explicit allowImageTargets approval"
+    },
+    {
+      "id": "path-only-policy",
+      "path": "windows-path-only-policy-drill.json",
+      "expectedOutcome": "executorError",
+      "expectedErrorContains": "path-only accessibility selectors require explicit allowPathOnlySelectors approval"
+    },
+    {
+      "id": "coordinate-policy",
+      "path": "windows-coordinate-policy-drill.json",
+      "expectedOutcome": "executorError",
+      "expectedErrorContains": "coordinate targets require explicit allowCoordinateTargets approval"
+    },
+    {
+      "id": "evidence-size-policy",
+      "path": "windows-actionability-readiness-drill.json",
+      "expectedOutcome": "succeeded",
+      "allowPathOnlySelectors": true,
+      "captureStepEvidence": true,
+      "evidenceMaxArtifactBytes": 1,
+      "pruneEvidenceBeforeRun": true,
+      "expectedLogContains": "evidence artifact exceeded configured size limit"
     }
   ]
 }

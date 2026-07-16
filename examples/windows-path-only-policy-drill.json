@@ -1,0 +1,23 @@
+{
+  "id": "windows-path-only-policy-drill",
+  "title": "Windows path-only selector policy drill",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "wait-path-only-target",
+      "kind": "waitFor",
+      "condition": {
+        "kind": "targetExists",
+        "target": {
+          "windowTitle": "Settings",
+          "accessibility": {
+            "path": []
+          }
+        }
+      },
+      "timeout": {
+        "millis": 250
+      }
+    }
+  ]
+}

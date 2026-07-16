@@ -19,6 +19,10 @@ const WINDOWS_MISSING_WINDOW_TIMEOUT_DRILL: &str =
     include_str!("../../../examples/windows-missing-window-timeout-drill.json");
 const WINDOWS_IMAGE_TARGET_POLICY_DRILL: &str =
     include_str!("../../../examples/windows-image-target-policy-drill.json");
+const WINDOWS_PATH_ONLY_POLICY_DRILL: &str =
+    include_str!("../../../examples/windows-path-only-policy-drill.json");
+const WINDOWS_COORDINATE_POLICY_DRILL: &str =
+    include_str!("../../../examples/windows-coordinate-policy-drill.json");
 const WINDOWS_DRILL_MANIFEST: &str = include_str!("../../../examples/windows-drill-manifest.json");
 
 #[test]
@@ -192,6 +196,22 @@ fn windows_image_target_policy_drill_remains_a_valid_definition() {
         parse_definition_json(WINDOWS_IMAGE_TARGET_POLICY_DRILL).expect("image drill parses");
 
     assert_eq!(definition.id, "windows-image-target-policy-drill");
+}
+
+#[test]
+fn windows_path_only_policy_drill_remains_a_valid_definition() {
+    let definition =
+        parse_definition_json(WINDOWS_PATH_ONLY_POLICY_DRILL).expect("path-only drill parses");
+
+    assert_eq!(definition.id, "windows-path-only-policy-drill");
+}
+
+#[test]
+fn windows_coordinate_policy_drill_remains_a_valid_definition() {
+    let definition =
+        parse_definition_json(WINDOWS_COORDINATE_POLICY_DRILL).expect("coordinate drill parses");
+
+    assert_eq!(definition.id, "windows-coordinate-policy-drill");
 }
 
 #[test]

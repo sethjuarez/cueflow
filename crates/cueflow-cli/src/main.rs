@@ -1,7 +1,9 @@
-use std::{collections::BTreeMap, env, fs, path::PathBuf, process::ExitCode};
+use std::{collections::BTreeMap, env, fs, path::PathBuf, process::ExitCode, time::Instant};
 
 use cueflow_adapters::{CurrentPlatformAdapter, current_platform};
-use cueflow_core::{Artifact, ArtifactKind, RunConfig, Target, parse_definition_json};
+use cueflow_core::{
+    Artifact, ArtifactKind, FailureKind, RunConfig, RunEvent, Target, parse_definition_json,
+};
 use cueflow_executor::{
     AutomationExecutor, PreflightReport, RunControl, RunEventSink, RunOutcome, RunReport,
     SystemClock,
@@ -249,13 +251,18 @@ fn main() -> ExitCode {
         }
     }
 
+    let mut evidence_prune_report = None;
     if command == "run"
         && options.prune_evidence_before_run
         && let Some(directory) = &options.evidence_dir
-        && let Err(error) = prune_evidence_directory(directory)
     {
-        eprintln!("failed to prune evidence directory: {error}");
-        return ExitCode::FAILURE;
+        match prune_evidence_directory(directory) {
+            Ok(report) => evidence_prune_report = Some(report),
+            Err(error) => {
+                eprintln!("failed to prune evidence directory: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     let report = executor.run_with(
@@ -274,7 +281,7 @@ fn main() -> ExitCode {
                     &definition.id,
                     &report,
                     options.evidence_max_artifact_bytes,
-                    options.prune_evidence_before_run,
+                    evidence_prune_report.as_ref(),
                 )
             {
                 eprintln!("failed to write evidence bundle: {error}");
@@ -419,6 +426,14 @@ struct DrillEntry {
     evidence_max_artifact_bytes: Option<u64>,
     #[serde(default)]
     prune_evidence_before_run: bool,
+    #[serde(default)]
+    expected_failure_kind: Option<FailureKind>,
+    #[serde(default)]
+    expected_error_contains: Option<String>,
+    #[serde(default)]
+    expected_log_contains: Option<String>,
+    #[serde(default)]
+    repeat: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -490,131 +505,188 @@ fn run_drill_manifest(manifest_path: PathBuf) -> ExitCode {
             }
         };
 
-        let evidence_dir = manifest.evidence_dir.as_ref().map(|dir| {
-            if dir.is_absolute() {
-                dir.join(&drill.id)
-            } else {
-                base_dir.join(dir).join(&drill.id)
-            }
-        });
-        let config = RunConfig {
-            dry_run: false,
-            platform: Some(current_platform()),
-            allow_coordinate_targets: drill.allow_coordinate_targets,
-            allow_path_only_selectors: drill.allow_path_only_selectors,
-            allow_value_capture: drill.allow_value_capture,
-            capture_step_evidence: drill.capture_step_evidence,
-            allow_screenshot_capture: drill.allow_screenshot_capture,
-            allow_image_targets: drill.allow_image_targets,
-            evidence_max_artifact_bytes: drill.evidence_max_artifact_bytes,
-            evidence_directory: evidence_dir.as_ref().map(|path| path.display().to_string()),
-            ..RunConfig::default()
-        };
+        let repeat = drill.repeat.unwrap_or(1).max(1);
+        for attempt in 1..=repeat {
+            let attempt_started_at = Instant::now();
+            let evidence_dir = manifest.evidence_dir.as_ref().map(|dir| {
+                let base = if dir.is_absolute() {
+                    dir.join(&drill.id)
+                } else {
+                    base_dir.join(dir).join(&drill.id)
+                };
+                if repeat > 1 {
+                    base.join(format!("attempt-{attempt}"))
+                } else {
+                    base
+                }
+            });
+            let config = RunConfig {
+                dry_run: false,
+                platform: Some(current_platform()),
+                allow_coordinate_targets: drill.allow_coordinate_targets,
+                allow_path_only_selectors: drill.allow_path_only_selectors,
+                allow_value_capture: drill.allow_value_capture,
+                capture_step_evidence: drill.capture_step_evidence,
+                allow_screenshot_capture: drill.allow_screenshot_capture,
+                allow_image_targets: drill.allow_image_targets,
+                evidence_max_artifact_bytes: drill.evidence_max_artifact_bytes,
+                evidence_directory: evidence_dir.as_ref().map(|path| path.display().to_string()),
+                ..RunConfig::default()
+            };
 
-        match executor.preflight(&definition, &config, &CurrentPlatformAdapter::new()) {
-            Ok(report) if report.can_run() => {}
-            Ok(report) => {
-                let matched = matches!(drill.expected_outcome, DrillExpectedOutcome::ExecutorError);
-                all_matched &= matched;
-                results.push(serde_json::json!({
-                    "id": drill.id,
-                    "path": drill_path,
-                    "expectedOutcome": drill.expected_outcome.as_str(),
-                    "actualOutcome": "executorError",
-                    "matched": matched,
-                    "error": format!("automation preflight failed: {}", preflight_messages(&report)),
-                }));
-                continue;
-            }
-            Err(error) => {
-                let matched = matches!(drill.expected_outcome, DrillExpectedOutcome::ExecutorError);
-                all_matched &= matched;
-                results.push(serde_json::json!({
-                    "id": drill.id,
-                    "path": drill_path,
-                    "expectedOutcome": drill.expected_outcome.as_str(),
-                    "actualOutcome": "executorError",
-                    "matched": matched,
-                    "error": error.to_string(),
-                }));
-                continue;
-            }
-        }
-
-        if drill.prune_evidence_before_run
-            && let Some(directory) = &evidence_dir
-            && let Err(error) = prune_evidence_directory(directory)
-        {
-            all_matched = false;
-            results.push(serde_json::json!({
-                "id": drill.id,
-                "path": drill_path,
-                "expectedOutcome": drill.expected_outcome.as_str(),
-                "actualOutcome": "invalid",
-                "matched": false,
-                "error": format!("failed to prune evidence directory: {error}"),
-            }));
-            continue;
-        }
-
-        let mut adapter = CurrentPlatformAdapter::new();
-        let control = RunControl::default();
-        let mut sink = QuietSink;
-        let clock = SystemClock::default();
-        let report = executor.run_with(
-            &definition,
-            config,
-            &mut adapter,
-            &control,
-            &mut sink,
-            &clock,
-        );
-
-        match report {
-            Ok(report) => {
-                if let Some(evidence_dir) = evidence_dir.as_ref()
-                    && let Err(error) = write_evidence_bundle(
-                        evidence_dir,
-                        &definition.id,
-                        &report,
-                        drill.evidence_max_artifact_bytes,
-                        drill.prune_evidence_before_run,
-                    )
-                {
-                    all_matched = false;
+            match executor.preflight(&definition, &config, &CurrentPlatformAdapter::new()) {
+                Ok(report) if report.can_run() => {}
+                Ok(report) => {
+                    let error = format!(
+                        "automation preflight failed: {}",
+                        preflight_messages(&report)
+                    );
+                    let matched =
+                        matches!(drill.expected_outcome, DrillExpectedOutcome::ExecutorError)
+                            && drill.expected_failure_kind.is_none()
+                            && expected_error_matches(drill, &error);
+                    all_matched &= matched;
                     results.push(serde_json::json!({
                         "id": drill.id,
+                        "attempt": attempt,
+                        "repeat": repeat,
+                        "durationMillis": attempt_started_at.elapsed().as_millis(),
                         "path": drill_path,
                         "expectedOutcome": drill.expected_outcome.as_str(),
-                        "actualOutcome": outcome_str(report.outcome),
-                        "matched": false,
-                        "error": format!("failed to write evidence bundle: {error}"),
+                        "actualOutcome": "executorError",
+                        "matched": matched,
+                        "error": error,
                     }));
                     continue;
                 }
-                let matched = drill.expected_outcome.matches(report.outcome);
-                all_matched &= matched;
-                results.push(serde_json::json!({
-                    "id": drill.id,
-                    "path": drill_path,
-                    "expectedOutcome": drill.expected_outcome.as_str(),
-                    "actualOutcome": outcome_str(report.outcome),
-                    "matched": matched,
-                    "runId": report.run_id,
-                    "eventCount": report.events.len(),
-                }));
+                Err(error) => {
+                    let error = error.to_string();
+                    let matched =
+                        matches!(drill.expected_outcome, DrillExpectedOutcome::ExecutorError)
+                            && drill.expected_failure_kind.is_none()
+                            && expected_error_matches(drill, &error);
+                    all_matched &= matched;
+                    results.push(serde_json::json!({
+                        "id": drill.id,
+                        "attempt": attempt,
+                        "repeat": repeat,
+                        "durationMillis": attempt_started_at.elapsed().as_millis(),
+                        "path": drill_path,
+                        "expectedOutcome": drill.expected_outcome.as_str(),
+                        "actualOutcome": "executorError",
+                        "matched": matched,
+                        "error": error,
+                    }));
+                    continue;
+                }
             }
-            Err(error) => {
-                let matched = matches!(drill.expected_outcome, DrillExpectedOutcome::ExecutorError);
-                all_matched &= matched;
-                results.push(serde_json::json!({
-                    "id": drill.id,
-                    "path": drill_path,
-                    "expectedOutcome": drill.expected_outcome.as_str(),
-                    "actualOutcome": "executorError",
-                    "matched": matched,
-                    "error": error.to_string(),
-                }));
+
+            let mut evidence_prune_report = None;
+            if drill.prune_evidence_before_run
+                && let Some(directory) = &evidence_dir
+            {
+                match prune_evidence_directory(directory) {
+                    Ok(report) => evidence_prune_report = Some(report),
+                    Err(error) => {
+                        all_matched = false;
+                        results.push(serde_json::json!({
+                            "id": drill.id,
+                            "attempt": attempt,
+                            "repeat": repeat,
+                            "durationMillis": attempt_started_at.elapsed().as_millis(),
+                            "path": drill_path,
+                            "expectedOutcome": drill.expected_outcome.as_str(),
+                            "actualOutcome": "invalid",
+                            "matched": false,
+                            "error": format!("failed to prune evidence directory: {error}"),
+                        }));
+                        continue;
+                    }
+                }
+            }
+
+            let mut adapter = CurrentPlatformAdapter::new();
+            let control = RunControl::default();
+            let mut sink = QuietSink;
+            let clock = SystemClock::default();
+            let report = executor.run_with(
+                &definition,
+                config,
+                &mut adapter,
+                &control,
+                &mut sink,
+                &clock,
+            );
+
+            match report {
+                Ok(report) => {
+                    if let Some(evidence_dir) = evidence_dir.as_ref()
+                        && let Err(error) = write_evidence_bundle(
+                            evidence_dir,
+                            &definition.id,
+                            &report,
+                            drill.evidence_max_artifact_bytes,
+                            evidence_prune_report.as_ref(),
+                        )
+                    {
+                        all_matched = false;
+                        results.push(serde_json::json!({
+                            "id": drill.id,
+                            "attempt": attempt,
+                            "repeat": repeat,
+                            "durationMillis": attempt_started_at.elapsed().as_millis(),
+                            "path": drill_path,
+                            "expectedOutcome": drill.expected_outcome.as_str(),
+                            "actualOutcome": outcome_str(report.outcome),
+                            "matched": false,
+                            "error": format!("failed to write evidence bundle: {error}"),
+                        }));
+                        continue;
+                    }
+                    let actual_failure_kind = report_failure_kind(&report);
+                    let actual_error = report_error_message(&report);
+                    let actual_log_matched = expected_log_matches(drill, &report);
+                    let matched = drill.expected_outcome.matches(report.outcome)
+                        && expected_failure_kind_matches(drill, actual_failure_kind)
+                        && expected_optional_error_matches(drill, actual_error.as_deref())
+                        && actual_log_matched;
+                    all_matched &= matched;
+                    results.push(serde_json::json!({
+                        "id": drill.id,
+                        "attempt": attempt,
+                        "repeat": repeat,
+                        "durationMillis": attempt_started_at.elapsed().as_millis(),
+                        "path": drill_path,
+                        "expectedOutcome": drill.expected_outcome.as_str(),
+                        "actualOutcome": outcome_str(report.outcome),
+                        "expectedFailureKind": drill.expected_failure_kind,
+                        "actualFailureKind": actual_failure_kind,
+                        "expectedLogMatched": actual_log_matched,
+                        "matched": matched,
+                        "runId": report.run_id,
+                        "eventCount": report.events.len(),
+                        "evidencePrune": evidence_prune_json(evidence_prune_report.as_ref()),
+                    }));
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    let matched =
+                        matches!(drill.expected_outcome, DrillExpectedOutcome::ExecutorError)
+                            && drill.expected_failure_kind.is_none()
+                            && expected_error_matches(drill, &error);
+                    all_matched &= matched;
+                    results.push(serde_json::json!({
+                        "id": drill.id,
+                        "attempt": attempt,
+                        "repeat": repeat,
+                        "durationMillis": attempt_started_at.elapsed().as_millis(),
+                        "path": drill_path,
+                        "expectedOutcome": drill.expected_outcome.as_str(),
+                        "actualOutcome": "executorError",
+                        "matched": matched,
+                        "error": error,
+                    }));
+                }
             }
         }
     }
@@ -642,6 +714,58 @@ fn preflight_messages(report: &PreflightReport) -> String {
         .map(|diagnostic| diagnostic.message.as_str())
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+fn report_failure_kind(report: &RunReport) -> Option<FailureKind> {
+    report.events.iter().rev().find_map(|event| match event {
+        RunEvent::StepFailed { error, .. } | RunEvent::ManualIntervention { error, .. } => {
+            error.failure_kind
+        }
+        _ => None,
+    })
+}
+
+fn report_error_message(report: &RunReport) -> Option<String> {
+    report.events.iter().rev().find_map(|event| match event {
+        RunEvent::StepFailed { error, .. } | RunEvent::ManualIntervention { error, .. } => {
+            Some(error.message.clone())
+        }
+        _ => None,
+    })
+}
+
+fn expected_failure_kind_matches(
+    drill: &DrillEntry,
+    actual_failure_kind: Option<FailureKind>,
+) -> bool {
+    drill
+        .expected_failure_kind
+        .is_none_or(|expected| Some(expected) == actual_failure_kind)
+}
+
+fn expected_error_matches(drill: &DrillEntry, actual_error: &str) -> bool {
+    drill
+        .expected_error_contains
+        .as_ref()
+        .is_none_or(|expected| actual_error.contains(expected))
+}
+
+fn expected_optional_error_matches(drill: &DrillEntry, actual_error: Option<&str>) -> bool {
+    match (&drill.expected_error_contains, actual_error) {
+        (Some(expected), Some(actual)) => actual.contains(expected),
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
+fn expected_log_matches(drill: &DrillEntry, report: &RunReport) -> bool {
+    let Some(expected) = &drill.expected_log_contains else {
+        return true;
+    };
+    report.events.iter().any(|event| match event {
+        RunEvent::Log { message, .. } => message.contains(expected),
+        _ => false,
+    })
 }
 
 impl DrillExpectedOutcome {
@@ -788,29 +912,54 @@ fn artifact_uri(path: PathBuf) -> String {
     format!("file://{}", path.strip_prefix(r"\\?\").unwrap_or(&path))
 }
 
-fn prune_evidence_directory(directory: &PathBuf) -> std::io::Result<()> {
+#[derive(Debug, Default)]
+struct EvidencePruneReport {
+    events_removed: bool,
+    summary_removed: bool,
+    steps_removed: bool,
+}
+
+fn prune_evidence_directory(directory: &PathBuf) -> std::io::Result<EvidencePruneReport> {
+    let mut report = EvidencePruneReport::default();
     let events_path = directory.join("events.jsonl");
     match fs::remove_file(&events_path) {
-        Ok(()) => {}
+        Ok(()) => report.events_removed = true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
 
     let summary_path = directory.join("summary.json");
     match fs::remove_file(&summary_path) {
-        Ok(()) => {}
+        Ok(()) => report.summary_removed = true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
 
     let steps_path = directory.join("steps");
     match fs::remove_dir_all(&steps_path) {
-        Ok(()) => {}
+        Ok(()) => report.steps_removed = true,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
 
-    Ok(())
+    Ok(report)
+}
+
+fn evidence_prune_json(report: Option<&EvidencePruneReport>) -> serde_json::Value {
+    match report {
+        Some(report) => serde_json::json!({
+            "requested": true,
+            "eventsRemoved": report.events_removed,
+            "summaryRemoved": report.summary_removed,
+            "stepsRemoved": report.steps_removed,
+        }),
+        None => serde_json::json!({
+            "requested": false,
+            "eventsRemoved": false,
+            "summaryRemoved": false,
+            "stepsRemoved": false,
+        }),
+    }
 }
 
 fn write_evidence_bundle(
@@ -818,7 +967,7 @@ fn write_evidence_bundle(
     automation_id: &str,
     report: &RunReport,
     evidence_max_artifact_bytes: Option<u64>,
-    pruned_before_run: bool,
+    prune_report: Option<&EvidencePruneReport>,
 ) -> std::io::Result<()> {
     fs::create_dir_all(directory)?;
     let events_path = directory.join("events.jsonl");
@@ -866,7 +1015,8 @@ fn write_evidence_bundle(
             "artifacts": artifacts,
             "retentionPolicy": {
                 "evidenceIsLocal": true,
-                "prunedBeforeRun": pruned_before_run,
+                "prunedBeforeRun": prune_report.is_some(),
+                "pruneBeforeRun": evidence_prune_json(prune_report),
                 "valuesCapturedOnlyWhenAllowed": true,
                 "desktopScreenshotsExcludedFromStepEvidence": true,
                 "defaultMaxArtifactBytes": 26214400u64,

@@ -56,6 +56,7 @@ pub struct AccessibilitySelectorCandidate {
     pub score: u8,
     pub target: Target,
     pub rationale: String,
+    pub changes: Vec<String>,
     pub warnings: Vec<String>,
 }
 

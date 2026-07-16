@@ -1,0 +1,20 @@
+{
+  "id": "windows-coordinate-policy-drill",
+  "title": "Windows coordinate target policy drill",
+  "schemaVersion": 1,
+  "steps": [
+    {
+      "id": "click-coordinate-target",
+      "kind": "clickTarget",
+      "target": {
+        "coordinates": {
+          "x": 1,
+          "y": 1
+        }
+      },
+      "timeout": {
+        "millis": 250
+      }
+    }
+  ]
+}

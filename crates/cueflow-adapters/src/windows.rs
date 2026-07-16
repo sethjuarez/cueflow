@@ -188,6 +188,12 @@ impl WindowsDesktopAdapter {
         };
         let mut candidates = Vec::new();
         collect_repair_candidates(&tree.root, target.accessibility.as_ref(), &mut candidates);
+        for candidate in &mut candidates {
+            candidate.changes = selector_candidate_changes(
+                target.accessibility.as_ref(),
+                candidate.target.accessibility.as_ref(),
+            );
+        }
         candidates.sort_by(|left, right| right.score.cmp(&left.score));
         let mut seen_targets = std::collections::BTreeSet::new();
         candidates.retain(|candidate| {
@@ -256,36 +262,38 @@ fn window_search_diagnostics(target: &Target, windows: &[HWND]) -> String {
         .iter()
         .take(8)
         .filter_map(|window| {
-            window_identity(*window).map(|identity| {
-                format!(
-                    "{} (handle={}, class={}, pid={}, process={}, bounds={}, foreground={}, minimized={}, owner={})",
-                    quote(&identity.title),
-                    identity.handle,
-                    quote(&identity.class_name),
-                    identity.process_id,
-                    identity
-                        .process_name
-                        .as_deref()
-                        .map(quote)
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    identity
-                        .bounds
-                        .map(|bounds| format!(
-                            "{},{},{},{}",
-                            bounds.left, bounds.top, bounds.right, bounds.bottom
-                        ))
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    identity.is_foreground,
-                    identity.is_minimized,
-                    identity.owner.as_deref().unwrap_or("none")
-                )
-            })
+            window_identity(*window).map(|identity| format_window_identity(&identity))
         })
         .collect::<Vec<_>>();
     format!(
         "selector: {}; visible window matches: {}",
         window_target_summary(target),
         list_or_none(&candidates)
+    )
+}
+
+fn format_window_identity(identity: &WindowIdentity) -> String {
+    format!(
+        "{} (handle={}, class={}, pid={}, process={}, bounds={}, foreground={}, minimized={}, owner={})",
+        quote(&identity.title),
+        identity.handle,
+        quote(&identity.class_name),
+        identity.process_id,
+        identity
+            .process_name
+            .as_deref()
+            .map(quote)
+            .unwrap_or_else(|| "unknown".to_string()),
+        identity
+            .bounds
+            .map(|bounds| format!(
+                "{},{},{},{}",
+                bounds.left, bounds.top, bounds.right, bounds.bottom
+            ))
+            .unwrap_or_else(|| "unknown".to_string()),
+        identity.is_foreground,
+        identity.is_minimized,
+        identity.owner.as_deref().unwrap_or("none")
     )
 }
 
@@ -692,7 +700,7 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
         };
 
         fs::create_dir_all(&evidence_dir)
-            .map_err(|_| AdapterError::new("Windows could not create step evidence directory"))?;
+            .map_err(|_| transient_error("Windows could not create step evidence directory"))?;
         let screenshot = if let (Some(window), Some(screenshot_path)) =
             (screenshot_window, screenshot_path.as_ref())
         {
@@ -705,7 +713,7 @@ impl ExecutionAdapter for WindowsDesktopAdapter {
             None
         };
         fs::write(&tree_path, tree_json)
-            .map_err(|_| AdapterError::new("Windows could not write accessibility evidence"))?;
+            .map_err(|_| transient_error("Windows could not write accessibility evidence"))?;
 
         let mut artifacts = vec![Artifact {
             kind: cueflow_core::ArtifactKind::AccessibilityTree,
@@ -738,6 +746,18 @@ fn enforce_evidence_artifact_size(size: u64, config: &RunConfig) -> Result<(), A
         .with_source("failureKind=policyDenied"));
     }
     Ok(())
+}
+
+fn transient_error(message: impl Into<String>) -> AdapterError {
+    AdapterError::new(message)
+        .with_failure_kind(FailureKind::Transient)
+        .with_source("failureKind=transient")
+}
+
+fn focus_denied_error(message: impl Into<String>) -> AdapterError {
+    AdapterError::new(message)
+        .with_failure_kind(FailureKind::FocusDenied)
+        .with_source("failureKind=focusDenied")
 }
 
 fn evidence_target(action: &Action) -> Option<&Target> {
@@ -1225,25 +1245,23 @@ fn bitmap_pixels(
         )
     };
     if rows == 0 {
-        return Err(AdapterError::new(
-            "Windows could not read screenshot pixels",
-        ));
+        return Err(transient_error("Windows could not read screenshot pixels"));
     }
     Ok(pixels)
 }
 
 fn bmp_file_size(width: i32, height: i32) -> Result<u64, AdapterError> {
-    let width = u64::try_from(width)
-        .map_err(|_| AdapterError::new("Windows screenshot width is invalid"))?;
+    let width =
+        u64::try_from(width).map_err(|_| transient_error("Windows screenshot width is invalid"))?;
     let height = u64::try_from(height)
-        .map_err(|_| AdapterError::new("Windows screenshot height is invalid"))?;
+        .map_err(|_| transient_error("Windows screenshot height is invalid"))?;
     let pixels = width
         .checked_mul(height)
-        .and_then(|value| value.checked_mul(4))
-        .ok_or_else(|| AdapterError::new("Windows screenshot size overflowed"))?;
+        .and_then(|value| value.checked_mul(4u64))
+        .ok_or_else(|| transient_error("Windows screenshot size overflowed"))?;
     (14u64 + 40u64)
         .checked_add(pixels)
-        .ok_or_else(|| AdapterError::new("Windows screenshot size overflowed"))
+        .ok_or_else(|| transient_error("Windows screenshot size overflowed"))
 }
 
 fn write_bmp(path: &Path, width: i32, height: i32, pixels: &[u8]) -> Result<(), AdapterError> {
@@ -1269,10 +1287,10 @@ fn write_bmp(path: &Path, width: i32, height: i32, pixels: &[u8]) -> Result<(), 
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|_| {
-            AdapterError::new("Windows could not create the screenshot output directory")
+            transient_error("Windows could not create the screenshot output directory")
         })?;
     }
-    fs::write(path, output).map_err(|_| AdapterError::new("Windows could not write screenshot"))
+    fs::write(path, output).map_err(|_| transient_error("Windows could not write screenshot"))
 }
 
 fn path_display(path: &Path) -> String {
@@ -1286,7 +1304,7 @@ fn focus_window(target: &Target) -> Result<(), AdapterError> {
     let window = find_window(target)?;
     unsafe {
         if !SetForegroundWindow(window).as_bool() {
-            return Err(AdapterError::new(
+            return Err(focus_denied_error(
                 "Windows could not focus the requested window",
             ));
         }
@@ -1302,11 +1320,9 @@ fn wait_for_foreground(window: HWND, label: &str) -> Result<(), AdapterError> {
         }
         thread::sleep(Duration::from_millis(25));
     }
-    Err(
-        AdapterError::new(format!("Windows did not foreground the {label}"))
-            .with_failure_kind(FailureKind::FocusDenied)
-            .with_source("failureKind=focusDenied"),
-    )
+    Err(focus_denied_error(format!(
+        "Windows did not foreground the {label}"
+    )))
 }
 
 fn window_exists(target: &Target) -> Result<bool, AdapterError> {
@@ -1552,7 +1568,7 @@ fn command_status(
     }
     let child = command
         .spawn()
-        .map_err(|_| AdapterError::new("Windows could not start the approved command"))?;
+        .map_err(|_| transient_error("Windows could not start the approved command"))?;
     let job = CommandJob::assign(&child)?;
     wait_for_command(child, &job, control, timeout)
 }
@@ -1575,7 +1591,7 @@ fn wait_for_command(
         }
         if let Some(status) = child
             .try_wait()
-            .map_err(|_| AdapterError::new("Windows could not observe the approved command"))?
+            .map_err(|_| transient_error("Windows could not observe the approved command"))?
         {
             return Ok(status);
         }
@@ -1585,10 +1601,10 @@ fn wait_for_command(
 
 fn terminate_command(child: &mut Child, job: &CommandJob) -> Result<(), AdapterError> {
     unsafe { TerminateJobObject(job.handle, 1) }
-        .map_err(|_| AdapterError::new("Windows could not stop the approved command tree"))?;
+        .map_err(|_| transient_error("Windows could not stop the approved command tree"))?;
     child
         .wait()
-        .map_err(|_| AdapterError::new("Windows could reap the approved command"))?;
+        .map_err(|_| transient_error("Windows could reap the approved command"))?;
     Ok(())
 }
 
@@ -1599,11 +1615,11 @@ struct CommandJob {
 impl CommandJob {
     fn assign(child: &Child) -> Result<Self, AdapterError> {
         let handle = unsafe { CreateJobObjectW(None, None) }
-            .map_err(|_| AdapterError::new("Windows could not create a command job"))?;
+            .map_err(|_| transient_error("Windows could not create a command job"))?;
         let job = Self { handle };
         let process = windows::Win32::Foundation::HANDLE(child.as_raw_handle());
         unsafe { AssignProcessToJobObject(job.handle, process) }
-            .map_err(|_| AdapterError::new("Windows could assign the command to its job"))?;
+            .map_err(|_| transient_error("Windows could assign the command to its job"))?;
         Ok(job)
     }
 }
@@ -2201,8 +2217,68 @@ fn selector_candidate(
             platform_selectors: BTreeMap::new(),
         },
         rationale: rationale.to_string(),
+        changes: Vec::new(),
         warnings,
     }
+}
+
+fn selector_candidate_changes(
+    original: Option<&cueflow_core::AccessibilityTarget>,
+    repaired: Option<&cueflow_core::AccessibilityTarget>,
+) -> Vec<String> {
+    let Some(repaired) = repaired else {
+        return Vec::new();
+    };
+
+    let mut changes = Vec::new();
+    push_optional_string_change(
+        &mut changes,
+        "id",
+        original.and_then(|target| target.id.as_deref()),
+        repaired.id.as_deref(),
+    );
+    push_optional_string_change(
+        &mut changes,
+        "name",
+        original.and_then(|target| target.name.as_deref()),
+        repaired.name.as_deref(),
+    );
+    push_optional_string_change(
+        &mut changes,
+        "controlType",
+        original.and_then(|target| target.control_type.as_deref()),
+        repaired.control_type.as_deref(),
+    );
+    let original_path = original.and_then(|target| target.path.as_deref());
+    if original_path != repaired.path.as_deref() {
+        changes.push(format!(
+            "path: {} -> {}",
+            format_optional_path(original_path),
+            format_optional_path(repaired.path.as_deref())
+        ));
+    }
+    changes
+}
+
+fn push_optional_string_change(
+    changes: &mut Vec<String>,
+    label: &str,
+    original: Option<&str>,
+    repaired: Option<&str>,
+) {
+    if original == repaired {
+        return;
+    }
+    changes.push(format!(
+        "{label}: {} -> {}",
+        original.map(quote).unwrap_or_else(|| "none".to_string()),
+        repaired.map(quote).unwrap_or_else(|| "none".to_string())
+    ));
+}
+
+fn format_optional_path(path: Option<&[u32]>) -> String {
+    path.map(format_accessibility_path)
+        .unwrap_or_else(|| "none".to_string())
 }
 
 fn has_children(
@@ -3514,6 +3590,34 @@ mod tests {
     }
 
     #[test]
+    fn window_identity_diagnostics_include_environment_state() {
+        let identity = WindowIdentity {
+            handle: "HWND(0x2a)".to_string(),
+            title: "Save As".to_string(),
+            class_name: "#32770".to_string(),
+            process_id: 42,
+            process_name: Some("notepad.exe".to_string()),
+            bounds: Some(AccessibilityBounds {
+                left: -10,
+                top: 20,
+                right: 640,
+                bottom: 480,
+            }),
+            is_foreground: false,
+            is_minimized: true,
+            owner: Some("HWND(0x10)".to_string()),
+        };
+
+        let diagnostic = format_window_identity(&identity);
+
+        assert!(diagnostic.contains("bounds=-10,20,640,480"));
+        assert!(diagnostic.contains("foreground=false"));
+        assert!(diagnostic.contains("minimized=true"));
+        assert!(diagnostic.contains("owner=HWND(0x10)"));
+        assert!(diagnostic.contains("process=\"notepad.exe\""));
+    }
+
+    #[test]
     fn accessibility_paths_use_root_and_child_index_notation() {
         assert_eq!(format_accessibility_path(&[]), "[]");
         assert_eq!(format_accessibility_path(&[0, 12, 3]), "[0,12,3]");
@@ -3549,6 +3653,33 @@ mod tests {
     }
 
     #[test]
+    fn selector_repair_changes_explain_candidate_differences() {
+        let original = cueflow_core::AccessibilityTarget {
+            id: Some("oldButton".to_string()),
+            name: Some("Old".to_string()),
+            control_type: Some("button".to_string()),
+            path: Some(vec![0, 1]),
+        };
+        let repaired = cueflow_core::AccessibilityTarget {
+            id: Some("submitButton".to_string()),
+            name: None,
+            control_type: Some("button".to_string()),
+            path: Some(vec![2, 1]),
+        };
+
+        let changes = selector_candidate_changes(Some(&original), Some(&repaired));
+
+        assert_eq!(
+            changes,
+            vec![
+                "id: \"oldButton\" -> \"submitButton\"",
+                "name: \"Old\" -> none",
+                "path: [0,1] -> [2,1]",
+            ]
+        );
+    }
+
+    #[test]
     fn write_bmp_emits_top_down_32bpp_bitmap() {
         let path = std::env::temp_dir().join(format!(
             "cueflow-write-bmp-{}-{}.bmp",
@@ -3573,6 +3704,17 @@ mod tests {
     #[test]
     fn bmp_file_size_matches_32bpp_header_and_pixels() {
         assert_eq!(bmp_file_size(2, 1).expect("size"), 62);
+    }
+
+    #[test]
+    fn typed_windows_error_helpers_attach_failure_kinds() {
+        let transient = transient_error("temporary Windows failure");
+        let focus = focus_denied_error("foreground denied");
+
+        assert_eq!(transient.failure_kind(), Some(FailureKind::Transient));
+        assert_eq!(focus.failure_kind(), Some(FailureKind::FocusDenied));
+        assert_eq!(transient.diagnostics(), Some("failureKind=transient"));
+        assert_eq!(focus.diagnostics(), Some("failureKind=focusDenied"));
     }
 
     #[test]
